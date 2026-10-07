@@ -9,6 +9,7 @@ import { appendLedger } from "./ledger/store.js";
 import type { LedgerRecord } from "./ledger/types.js";
 import { globalTasteDir, ledgerPath, projectTasteDir } from "./ledger/paths.js";
 import { resolveTasteModel } from "./model-resolver.js";
+import { runTastePrune } from "./prune.js";
 import { reconcileCandidate } from "./reconcile.js";
 import { serializeSourceAddressedBranchEntries } from "./serialize.js";
 import {
@@ -44,6 +45,7 @@ export interface ConsolidationSummary {
 	chunks: number;
 	signalsRecorded: number;
 	entriesUpserted: number;
+	entriesRetracted: number;
 	/** True when the branch was drained; false when the chunk cap was reached. */
 	reachedEnd: boolean;
 }
@@ -182,5 +184,15 @@ export async function runTasteConsolidation(
 		chunks++;
 	}
 
-	return { chunks, signalsRecorded, entriesUpserted, reachedEnd };
+	// Prune runs once over the whole active pool after extraction, not per chunk:
+	// contradiction detection needs the complete profile to compare against.
+	let entriesRetracted = 0;
+	try {
+		const pruned = await runTastePrune(runtime, { cwd: ctx.cwd, modelRegistry: ctx.modelRegistry });
+		entriesRetracted = pruned.retractions.length;
+	} catch (error) {
+		runtime.recordStageError("prune", error);
+	}
+
+	return { chunks, signalsRecorded, entriesUpserted, entriesRetracted, reachedEnd };
 }
