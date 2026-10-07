@@ -19,6 +19,10 @@ var DEFAULTS = {
   injectionConfidenceFloor: 0.5,
   maxInjectedTokens: 1200,
   promoteAtProjectCount: 2,
+  extractChunkMaxTokens: void 0,
+  consolidateMaxChunks: 8,
+  agentMaxTurns: 12,
+  agentMaxTokens: 16e3,
   modelMap: [],
   debugLog: false,
   passive: false
@@ -43,6 +47,61 @@ function positiveInteger(value) {
 }
 function probability(value) {
   return typeof value === "number" && Number.isFinite(value) && value >= 0 && value <= 1 ? value : void 0;
+}
+function globToRegExp(glob) {
+  const escaped = glob.replace(/[.+^${}()|[\]\\]/gu, "\\$&").replace(/\*/gu, ".*").replace(/\?/gu, ".");
+  return new RegExp(`^${escaped}$`, "i");
+}
+function parseMatchSelector(selector) {
+  const lastColon = selector.lastIndexOf(":");
+  if (lastColon !== -1) {
+    const suffix = selector.slice(lastColon + 1);
+    if (isThinkingLevel(suffix)) return { glob: selector.slice(0, lastColon), thinking: suffix };
+  }
+  return { glob: selector };
+}
+function resolveModelString(model, session) {
+  let text = model.trim();
+  if (!text) return void 0;
+  if (session.provider !== void 0) text = text.replaceAll("$provider", session.provider);
+  if (session.id !== void 0) text = text.replaceAll("$id", session.id);
+  if (session.provider !== void 0 && session.id !== void 0) {
+    text = text.replaceAll("$model", `${session.provider}/${session.id}`);
+  }
+  if (session.thinking !== void 0) text = text.replaceAll("$thinking", session.thinking);
+  else text = text.replace(/:\$thinking/gu, "").replace(/\$thinking/gu, "");
+  if (text.includes("$provider") || text.includes("$id") || text.includes("$model") || text.includes("$thinking")) {
+    return void 0;
+  }
+  const parsed = parseMatchSelector(text);
+  const slash = parsed.glob.indexOf("/");
+  if (slash <= 0 || slash === parsed.glob.length - 1) return void 0;
+  const provider = parsed.glob.slice(0, slash);
+  const id = parsed.glob.slice(slash + 1);
+  if (!provider || !id) return void 0;
+  const resolved = { provider, id };
+  if (parsed.thinking !== void 0) resolved.thinking = parsed.thinking;
+  return resolved;
+}
+function activeModelKey(model) {
+  if (!isRecord(model)) return void 0;
+  const provider = nonEmptyString(model.provider);
+  const id = nonEmptyString(model.id);
+  return provider && id ? `${provider}/${id}` : void 0;
+}
+function resolveConfiguredModel(config, activeModel, stage, sessionThinking) {
+  const key = activeModelKey(activeModel);
+  if (key) {
+    const slash = key.indexOf("/");
+    const session = { provider: key.slice(0, slash), id: key.slice(slash + 1), thinking: sessionThinking };
+    for (const entry of config.modelMap) {
+      if (entry.stages && (!stage || !entry.stages.includes(stage))) continue;
+      if (!globToRegExp(entry.match).test(key)) continue;
+      const resolved = resolveModelString(entry.model, session);
+      if (resolved) return resolved;
+    }
+  }
+  return config.model;
 }
 function normalizeModel(value) {
   if (!isRecord(value)) return void 0;
@@ -103,6 +162,14 @@ function normalizeSettingsConfig(value) {
   if (budget !== void 0) normalized.maxInjectedTokens = budget;
   const promote = positiveInteger(value.promoteAtProjectCount);
   if (promote !== void 0) normalized.promoteAtProjectCount = promote;
+  const extractChunk = positiveInteger(value.extractChunkMaxTokens);
+  if (extractChunk !== void 0) normalized.extractChunkMaxTokens = extractChunk;
+  const maxChunks = positiveInteger(value.consolidateMaxChunks);
+  if (maxChunks !== void 0) normalized.consolidateMaxChunks = maxChunks;
+  const agentMaxTurns = positiveInteger(value.agentMaxTurns);
+  if (agentMaxTurns !== void 0) normalized.agentMaxTurns = agentMaxTurns;
+  const agentMaxTokens = positiveInteger(value.agentMaxTokens);
+  if (agentMaxTokens !== void 0) normalized.agentMaxTokens = agentMaxTokens;
   const model = normalizeModel(value.model);
   if (model) normalized.model = model;
   const fallbackModel = normalizeModel(value.fallbackModel);
@@ -172,54 +239,15 @@ function setTasteEnabled(args) {
   return path;
 }
 
-// src/ledger/fold.ts
-function foldLedger(records) {
-  const signalsById = /* @__PURE__ */ new Map();
-  const entriesById = /* @__PURE__ */ new Map();
-  const retractedIds = /* @__PURE__ */ new Set();
-  for (const record of records) {
-    switch (record.type) {
-      case "signal.recorded":
-        signalsById.set(record.signal.id, record.signal);
-        break;
-      case "entry.upserted":
-        entriesById.set(record.entry.id, record.entry);
-        retractedIds.delete(record.entry.id);
-        break;
-      case "entry.retracted":
-        retractedIds.add(record.entryId);
-        break;
-    }
-  }
-  const activeEntries = Array.from(entriesById.values()).filter((entry) => !retractedIds.has(entry.id));
-  return { signalsById, entriesById, retractedIds, activeEntries };
-}
+// src/agents/extract/agent.ts
+import { agentLoop } from "@earendil-works/pi-agent-core";
+import { Type } from "@earendil-works/pi-ai";
 
-// src/ledger/paths.ts
-import { join as join2, resolve } from "node:path";
-import { getAgentDir as getAgentDir2 } from "@earendil-works/pi-coding-agent";
-var TASTE_DIR_NAME = "taste";
-var GLOBAL_TASTE_KEY = "global";
-var LEDGER_FILE_NAME = "ledger.ndjson";
-function encodeCwd(cwd) {
-  const resolved = resolve(cwd);
-  return `--${resolved.replace(/^[/\\]/u, "").replace(/[/\\:]/gu, "-")}--`;
+// src/ids.ts
+import { createHash } from "node:crypto";
+function hashId(content) {
+  return createHash("sha256").update(content).digest("hex").slice(0, 12);
 }
-function tasteRootDir() {
-  return join2(getAgentDir2(), TASTE_DIR_NAME);
-}
-function projectTasteDir(cwd) {
-  return join2(tasteRootDir(), encodeCwd(cwd));
-}
-function globalTasteDir() {
-  return join2(tasteRootDir(), GLOBAL_TASTE_KEY);
-}
-function ledgerPath(dir) {
-  return join2(dir, LEDGER_FILE_NAME);
-}
-
-// src/ledger/store.ts
-import { appendFileSync, existsSync as existsSync2, mkdirSync as mkdirSync2, readFileSync as readFileSync2 } from "node:fs";
 
 // src/ledger/types.ts
 var SIGNAL_KINDS = ["stated", "correction", "explicit"];
@@ -268,7 +296,32 @@ function isLedgerRecord(value) {
   }
 }
 
+// src/ledger/paths.ts
+import { join as join2, resolve } from "node:path";
+import { getAgentDir as getAgentDir2 } from "@earendil-works/pi-coding-agent";
+var TASTE_DIR_NAME = "taste";
+var GLOBAL_TASTE_KEY = "global";
+var LEDGER_FILE_NAME = "ledger.ndjson";
+function encodeCwd(cwd) {
+  const resolved = resolve(cwd);
+  return `--${resolved.replace(/^[/\\]/u, "").replace(/[/\\:]/gu, "-")}--`;
+}
+function tasteRootDir() {
+  return join2(getAgentDir2(), TASTE_DIR_NAME);
+}
+function projectTasteDir(cwd) {
+  return join2(tasteRootDir(), encodeCwd(cwd));
+}
+function globalTasteDir() {
+  return join2(tasteRootDir(), GLOBAL_TASTE_KEY);
+}
+function ledgerPath(dir) {
+  return join2(dir, LEDGER_FILE_NAME);
+}
+
 // src/ledger/store.ts
+import { appendFileSync, existsSync as existsSync2, mkdirSync as mkdirSync2, readFileSync as readFileSync2 } from "node:fs";
+import { dirname as dirname2 } from "node:path";
 function readLedger(path) {
   if (!existsSync2(path)) return [];
   let text;
@@ -288,6 +341,587 @@ function readLedger(path) {
     }
   }
   return records;
+}
+function appendLedger(path, records) {
+  if (records.length === 0) return;
+  mkdirSync2(dirname2(path), { recursive: true });
+  appendFileSync(path, `${records.map((record) => JSON.stringify(record)).join("\n")}
+`, "utf-8");
+}
+
+// src/ledger/fold.ts
+function foldLedger(records) {
+  const signalsById = /* @__PURE__ */ new Map();
+  const entriesById = /* @__PURE__ */ new Map();
+  const retractedIds = /* @__PURE__ */ new Set();
+  for (const record of records) {
+    switch (record.type) {
+      case "signal.recorded":
+        signalsById.set(record.signal.id, record.signal);
+        break;
+      case "entry.upserted":
+        entriesById.set(record.entry.id, record.entry);
+        retractedIds.delete(record.entry.id);
+        break;
+      case "entry.retracted":
+        retractedIds.add(record.entryId);
+        break;
+    }
+  }
+  const activeEntries = Array.from(entriesById.values()).filter((entry) => !retractedIds.has(entry.id));
+  return { signalsById, entriesById, retractedIds, activeEntries };
+}
+
+// src/model-budget.ts
+var AGENT_LOOP_MAX_TOKENS = 16e3;
+function boundedMaxTokens(model, requested = AGENT_LOOP_MAX_TOKENS) {
+  return typeof model.maxTokens === "number" && model.maxTokens > 0 ? Math.min(model.maxTokens, requested) : requested;
+}
+
+// src/tokens.ts
+import { estimateTokens as estimateMessageTokens } from "@earendil-works/pi-coding-agent";
+function estimateStringTokens(text) {
+  return Math.ceil(text.length / 4);
+}
+
+// src/serialize.ts
+function pad(n) {
+  return n.toString().padStart(2, "0");
+}
+function fmtLocal(d) {
+  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}`;
+}
+function formatTimestamp(v) {
+  if (v === void 0) return "????-??-?? ??:??";
+  const d = new Date(v);
+  return Number.isNaN(d.getTime()) ? "????-??-?? ??:??" : fmtLocal(d);
+}
+function textAndPlaceholders(content) {
+  if (typeof content === "string") return content;
+  if (!Array.isArray(content)) return "[non-text content omitted]";
+  const parts = [];
+  for (const block of content) {
+    if (!block || typeof block !== "object") {
+      parts.push("[non-text content omitted]");
+      continue;
+    }
+    if (block.type === "text" && typeof block.text === "string") {
+      parts.push(block.text);
+      continue;
+    }
+    if (block.type === "thinking") {
+      if (block.redacted === true) continue;
+      if (typeof block.thinking === "string") {
+        parts.push(`[thinking: ${block.thinking}]`);
+        continue;
+      }
+      parts.push("[non-text content omitted]");
+      continue;
+    }
+    if (block.type === "toolCall" && typeof block.name === "string") {
+      parts.push(`[${block.name}(${JSON.stringify(block.arguments ?? {})})]`);
+      continue;
+    }
+    parts.push("[non-text content omitted]");
+  }
+  return parts.join("\n");
+}
+function textOnly(content) {
+  if (content == null) return "";
+  if (typeof content === "string") return content;
+  if (!Array.isArray(content)) return "";
+  return content.filter((b) => b?.type === "text" && typeof b.text === "string").map((b) => b.text).join("\n");
+}
+function serializeConversation(messages) {
+  return messages.map((msg) => {
+    const time = formatTimestamp(msg.timestamp);
+    if (msg.role === "user") {
+      return `[User @ ${time}]: ${textOnly(msg.content)}`;
+    }
+    if (msg.role === "assistant") {
+      const body = textAndPlaceholders(msg.content).split("\n").filter(Boolean).join("\n");
+      return body ? `[Assistant @ ${time}]: ${body}` : null;
+    }
+    return `[Tool result for ${msg.toolName} @ ${time}]: ${textOnly(msg.content)}`;
+  }).filter((line) => line !== null).join("\n\n");
+}
+function nowTimestamp() {
+  return fmtLocal(/* @__PURE__ */ new Date());
+}
+var MAX_RECORD_CONTENT_CHARS = 1e4;
+function truncateRecordContent(content) {
+  if (content.length <= MAX_RECORD_CONTENT_CHARS) return content;
+  const head = content.slice(0, MAX_RECORD_CONTENT_CHARS);
+  const dropped = content.length - MAX_RECORD_CONTENT_CHARS;
+  return `${head} \u2026 [truncated ${dropped} chars]`;
+}
+function renderCustomMessage(entry) {
+  const time = formatTimestamp(entry.timestamp);
+  const text = typeof entry.content === "string" ? entry.content : Array.isArray(entry.content) ? entry.content.filter((b) => b?.type === "text" && typeof b.text === "string").map((b) => b.text).join("\n") : "";
+  const tag = entry.customType ? `Custom (${entry.customType})` : "Custom";
+  return `[${tag} @ ${time}]: ${text}`;
+}
+function serializeBranchEntries(entries) {
+  const blocks = [];
+  for (const entry of entries) {
+    if (entry.type === "message" && entry.message) {
+      const part = serializeConversation([entry.message]);
+      if (part) blocks.push(part);
+      continue;
+    }
+    if (entry.type === "custom_message") {
+      blocks.push(renderCustomMessage(entry));
+      continue;
+    }
+    if (entry.type === "branch_summary" && typeof entry.summary === "string") {
+      blocks.push(`[Branch summary @ ${formatTimestamp(entry.timestamp)}]: ${entry.summary}`);
+    }
+  }
+  return blocks.join("\n\n");
+}
+var SOURCE_OMISSION_MARKER = "\n\n[\u2026 middle omitted: source exceeds extraction input budget; original source remains in the session ledger \u2026]\n\n";
+function truncateSourceBlockToTokenBudget(label, rendered, maxTokens) {
+  const required = `${label}
+${SOURCE_OMISSION_MARKER}`;
+  if (estimateStringTokens(required) > maxTokens) return void 0;
+  const full = `${label}
+${rendered}`;
+  if (estimateStringTokens(full) <= maxTokens) return full;
+  const maxChars = Math.max(1, maxTokens * 4);
+  const fixed = `${label}
+${SOURCE_OMISSION_MARKER}`;
+  const retainedChars = maxChars - fixed.length;
+  const headChars = Math.ceil(retainedChars / 2);
+  const tailChars = retainedChars - headChars;
+  return `${label}
+${rendered.slice(0, headChars)}${SOURCE_OMISSION_MARKER}${tailChars > 0 ? rendered.slice(-tailChars) : ""}`;
+}
+function isSourceRenderableEntry(entry) {
+  return entry.type === "message" || entry.type === "custom_message" || entry.type === "branch_summary";
+}
+function serializeSourceAddressedBranchEntries(entries, options = {}) {
+  const blocks = [];
+  const sourceEntryIds = [];
+  const truncatedSourceEntryIds = [];
+  let estimatedTokens = 0;
+  for (const entry of entries) {
+    if (!entry.id || !isSourceRenderableEntry(entry)) continue;
+    const rendered = serializeBranchEntries([entry]);
+    if (!rendered.trim()) continue;
+    const label = `[Source entry id: ${entry.id}]`;
+    const block = `${label}
+${rendered}`;
+    const separator = blocks.length > 0 ? "\n\n" : "";
+    const blockTokens = estimateStringTokens(`${separator}${block}`);
+    const maxTokens = options.maxTokens;
+    if (maxTokens !== void 0 && estimatedTokens + blockTokens > maxTokens) {
+      if (blocks.length > 0) break;
+      const excerpt = truncateSourceBlockToTokenBudget(label, rendered, maxTokens);
+      if (!excerpt) break;
+      blocks.push(excerpt);
+      sourceEntryIds.push(entry.id);
+      truncatedSourceEntryIds.push(entry.id);
+      estimatedTokens = estimateStringTokens(excerpt);
+      break;
+    }
+    blocks.push(block);
+    sourceEntryIds.push(entry.id);
+    estimatedTokens += blockTokens;
+  }
+  const text = blocks.join("\n\n");
+  return { text, sourceEntryIds, estimatedTokens: estimateStringTokens(text), truncatedSourceEntryIds };
+}
+
+// src/agents/stream-errors.ts
+function logAgentStreamError(stage, event) {
+  const message = event.message;
+  if (message?.role === "assistant" && (message.stopReason === "error" || message.stopReason === "aborted")) {
+    void stage;
+  }
+}
+
+// src/agents/worker-stream.ts
+import { getApiProvider, streamSimple as compatStreamSimple } from "@earendil-works/pi-ai/compat";
+var BUILTIN_APIS = {
+  "openai-completions": true,
+  "mistral-conversations": true,
+  "openai-responses": true,
+  "azure-openai-responses": true,
+  "openai-codex-responses": true,
+  "anthropic-messages": true,
+  "bedrock-converse-stream": true,
+  "google-generative-ai": true,
+  "google-vertex": true,
+  "pi-messages": true
+};
+function resolveWorkerStreamSimple(model, modelRegistry, override) {
+  if (override) return override;
+  if (!Object.hasOwn(BUILTIN_APIS, model.api) && getApiProvider(model.api)) {
+    return compatStreamSimple;
+  }
+  const registryStream = modelRegistry?.streamSimple;
+  if (typeof registryStream === "function") {
+    return (nextModel, context, options) => registryStream.call(modelRegistry, nextModel, context, options);
+  }
+  try {
+    const config = modelRegistry?.getRegisteredProviderConfig?.(model.provider);
+    const composed = config?.streamSimple;
+    if (config?.api === model.api && typeof composed === "function") {
+      return composed;
+    }
+  } catch {
+  }
+  return compatStreamSimple;
+}
+
+// src/agents/extract/prompts.ts
+var EXTRACT_SYSTEM = `You are the taste-extraction agent for pi.
+
+You read a chunk of a coding session and record the user's durable, generalizable preferences about how code and work should be done. You are extracting evidence, not conclusions: record what the user expressed, not your interpretation of what they probably want.
+
+Record a signal when the user:
+- states a preference ("always use tabs", "prefer named exports", "don't add comments"),
+- corrects the assistant ("no, use X", "that's wrong, do Y", "I said ...", "instead ..."),
+- states a standing constraint about tooling, workflow, testing, naming, error handling, or communication.
+
+Do NOT record:
+- one-off task details ("rename this function", "fix this bug"),
+- facts about the current task that will not hold in a later session,
+- anything the assistant decided on its own,
+- a preference you cannot point to a specific source entry for.
+
+Each signal is a single line in the user's own words or a close paraphrase, and must cite the source entry ids that support it, using only ids shown in "[Source entry id: ...]" labels. Never invent ids.
+
+Call record_signals with a batch. You may call it more than once. When the chunk holds no durable preference, do not call the tool and reply "no signals".`;
+
+// src/agents/extract/agent.ts
+var SignalKindSchema = Type.Union([
+  Type.Literal("stated"),
+  Type.Literal("correction"),
+  Type.Literal("explicit")
+]);
+var RecordSignalsSchema = Type.Object({
+  signals: Type.Array(
+    Type.Object({
+      content: Type.String({
+        minLength: 1,
+        description: "Single-line preference in the user's own words. No markdown, no tags."
+      }),
+      kind: SignalKindSchema,
+      sourceEntryIds: Type.Array(Type.String({ minLength: 1 }), {
+        minItems: 1,
+        description: "Exact source entry ids from the chunk that support this signal. Use only ids shown in '[Source entry id: ...]' labels; never invent ids."
+      })
+    }),
+    { description: "Batch of new signals. Omit the tool call entirely when the chunk has none." }
+  )
+});
+var ExtractionStreamError = class extends Error {
+  stopReason;
+  constructor(stopReason, errorMessage) {
+    super(`extraction stream ended with stopReason "${stopReason}"${errorMessage ? `: ${errorMessage}` : ""}`);
+    this.name = "ExtractionStreamError";
+    this.stopReason = stopReason;
+  }
+};
+function normalizeSourceEntryIds(sourceEntryIds, allowedSourceEntryIds) {
+  if (!sourceEntryIds || sourceEntryIds.length === 0) return void 0;
+  const allowedOrder = /* @__PURE__ */ new Map();
+  for (let i = 0; i < allowedSourceEntryIds.length; i++) allowedOrder.set(allowedSourceEntryIds[i], i);
+  const seen = /* @__PURE__ */ new Set();
+  for (const id of sourceEntryIds) {
+    if (!allowedOrder.has(id)) return void 0;
+    seen.add(id);
+  }
+  if (seen.size === 0) return void 0;
+  return Array.from(seen).sort((a, b) => (allowedOrder.get(a) ?? 0) - (allowedOrder.get(b) ?? 0));
+}
+async function runExtraction(args) {
+  const conversation = args.chunk.trim();
+  if (!conversation) return void 0;
+  const now = args.now ?? nowTimestamp;
+  const accumulated = /* @__PURE__ */ new Map();
+  const recordSignals = {
+    name: "record_signals",
+    label: "Record signals",
+    description: "Record a batch of durable user preferences found in the conversation chunk. Call it as you work through the chunk; stop when the chunk is covered and reply with a short plain-text confirmation.",
+    parameters: RecordSignalsSchema,
+    execute: async (_id, params) => {
+      let added = 0;
+      let duplicates = 0;
+      let rejected = 0;
+      for (const candidate of params.signals) {
+        const sourceEntryIds = normalizeSourceEntryIds(candidate.sourceEntryIds, args.allowedSourceEntryIds);
+        if (!sourceEntryIds) {
+          rejected++;
+          continue;
+        }
+        const content = truncateRecordContent(candidate.content);
+        const id = hashId(normalizeTasteContent(content));
+        if (accumulated.has(id)) {
+          duplicates++;
+          continue;
+        }
+        accumulated.set(id, {
+          id,
+          content,
+          timestamp: now(),
+          kind: candidate.kind,
+          projectKey: args.projectKey,
+          sourceEntryIds,
+          ...args.sessionId ? { sessionId: args.sessionId } : {}
+        });
+        added++;
+      }
+      const rejectedPart = rejected > 0 ? ` ${rejected} rejected for missing or invalid sourceEntryIds.` : "";
+      return {
+        content: [{
+          type: "text",
+          text: `Recorded ${added} new signal${added === 1 ? "" : "s"} ` + (duplicates > 0 ? `(${duplicates} duplicate${duplicates === 1 ? "" : "s"} skipped).` : ".") + rejectedPart + ` Total so far this run: ${accumulated.size}. Continue if the chunk still has uncovered preferences; otherwise stop calling the tool.`
+        }],
+        details: { added, duplicates, rejected, total: accumulated.size }
+      };
+    }
+  };
+  const userText = `Current local time: ${now()}
+
+Extract durable user preferences from the new conversation chunk below by calling record_signals one or more times. Cite only source entry ids shown in the chunk. If the chunk contains no durable preference, do not call the tool and reply "no signals".
+
+NEW CONVERSATION CHUNK:
+${conversation}`;
+  const prompts = [
+    { role: "user", content: [{ type: "text", text: userText }], timestamp: Date.now() }
+  ];
+  const context = {
+    messages: [{ role: "system", content: EXTRACT_SYSTEM, timestamp: Date.now() }],
+    tools: [recordSignals]
+  };
+  const reasoning = args.model.reasoning;
+  const thinkingLevel = args.thinkingLevel ?? "low";
+  const effectiveMaxTurns = args.maxTurns && args.maxTurns > 0 ? args.maxTurns : void 0;
+  let turnCount = 0;
+  const config = {
+    model: args.model,
+    apiKey: args.apiKey,
+    headers: args.headers,
+    env: args.env,
+    maxTokens: boundedMaxTokens(args.model, args.maxOutputTokens ?? AGENT_LOOP_MAX_TOKENS),
+    convertToLlm: (messages) => messages,
+    toolExecution: "sequential",
+    ...reasoning && thinkingLevel !== "off" ? { reasoning: thinkingLevel } : {},
+    ...effectiveMaxTurns !== void 0 ? {
+      finishTurn: (turn) => {
+        if (turn.message.stopReason === "error" || turn.message.stopReason === "aborted") return;
+        turnCount++;
+        return turnCount >= effectiveMaxTurns ? { action: "end" } : void 0;
+      }
+    } : {}
+  };
+  const loop = args.agentLoop ?? agentLoop;
+  const stream = loop(
+    prompts,
+    context,
+    config,
+    args.signal,
+    resolveWorkerStreamSimple(args.model, args.modelRegistry, args.streamSimple)
+  );
+  let streamError;
+  for await (const event of stream) {
+    args.usage?.addEvent(event);
+    logAgentStreamError("extract", event);
+    const message = event.message;
+    if (message?.role === "assistant" && (message.stopReason === "error" || message.stopReason === "aborted")) {
+      streamError = { stopReason: message.stopReason, errorMessage: message.errorMessage };
+    }
+  }
+  await stream.result();
+  if (accumulated.size === 0) {
+    if (streamError) throw new ExtractionStreamError(streamError.stopReason, streamError.errorMessage);
+    return void 0;
+  }
+  return Array.from(accumulated.values());
+}
+
+// src/model-resolver.ts
+function usableHeaderCount(headers) {
+  if (!headers || typeof headers !== "object") return 0;
+  return Object.values(headers).filter(
+    (value) => typeof value === "string" && value.length > 0
+  ).length;
+}
+function hasUsableAuth(auth) {
+  if (typeof auth.apiKey === "string" && auth.apiKey.length > 0) return true;
+  return usableHeaderCount(auth.headers) > 0;
+}
+function hasConfiguredProviderCredential(registry, model) {
+  try {
+    return registry.hasConfiguredAuth?.(model) === true;
+  } catch {
+    return false;
+  }
+}
+async function resolveCandidate(registry, model) {
+  const auth = await registry.getApiKeyAndHeaders(model);
+  const provider = model.provider ?? "unknown";
+  const isOAuth = registry.isUsingOAuth?.(model) === true;
+  const usable = hasUsableAuth(auth);
+  const resolvedEmptyApiKey = typeof auth.apiKey === "string" && auth.apiKey.length === 0;
+  const providerCredentialConfigured = hasConfiguredProviderCredential(registry, model);
+  const signsAtRequestTime = auth.ok === true && !isOAuth && !resolvedEmptyApiKey && providerCredentialConfigured;
+  if (auth.ok !== true || !usable && !signsAtRequestTime) {
+    const reason = isOAuth ? `authentication failed for provider "${provider}"; run '/login ${provider}'` : `no API key or auth headers for provider "${provider}"`;
+    return { ok: false, reason };
+  }
+  const requestModel = auth.baseUrl ? { ...model, baseUrl: auth.baseUrl } : model;
+  return {
+    ok: true,
+    model: requestModel,
+    apiKey: auth.apiKey,
+    headers: auth.headers,
+    env: auth.env,
+    baseUrl: auth.baseUrl
+  };
+}
+async function resolveTasteModel(runtime, ctx) {
+  const registry = ctx.modelRegistry;
+  let model = ctx.model;
+  const configured = resolveConfiguredModel(runtime.config, ctx.model, ctx.stage, ctx.thinkingLevel);
+  let thinking = configured?.thinking;
+  if (configured) {
+    const found = registry.find?.(configured.provider, configured.id);
+    if (found) model = found;
+    else thinking = void 0;
+  }
+  if (!model) return void 0;
+  const primary = await resolveCandidate(registry, model);
+  if (primary.ok) return { ...primary, thinking };
+  const fallback = runtime.config.fallbackModel;
+  if (!fallback) return void 0;
+  const fallbackModel = registry.find?.(fallback.provider, fallback.id);
+  if (!fallbackModel) return void 0;
+  const resolvedFallback = await resolveCandidate(registry, fallbackModel);
+  if (!resolvedFallback.ok) return void 0;
+  return {
+    ...resolvedFallback,
+    thinking: fallback.thinking,
+    fallbackUsed: true,
+    primaryFailure: primary.reason
+  };
+}
+
+// src/session/coverage.ts
+var TASTE_COVERAGE = "taste.coverage";
+var SOURCE_ENTRY_TYPES = /* @__PURE__ */ new Set(["message", "custom_message", "branch_summary"]);
+function isSourceEntry(entry) {
+  return SOURCE_ENTRY_TYPES.has(entry.type);
+}
+function entryIndexById(entries) {
+  const idToIndex = /* @__PURE__ */ new Map();
+  for (let i = 0; i < entries.length; i++) idToIndex.set(entries[i].id, i);
+  return idToIndex;
+}
+function isTasteCoverageData(value) {
+  return typeof value === "object" && value !== null && typeof value.coversUpToId === "string";
+}
+function isValidCoverageEntry(entry) {
+  return entry.type === "custom" && entry.customType === TASTE_COVERAGE && isTasteCoverageData(entry.data);
+}
+function latestCoverageIndex(entries) {
+  const idToIndex = entryIndexById(entries);
+  let latest = -1;
+  for (const entry of entries) {
+    if (!isValidCoverageEntry(entry)) continue;
+    const coveredIndex = idToIndex.get(entry.data.coversUpToId);
+    if (coveredIndex !== void 0 && coveredIndex > latest) latest = coveredIndex;
+  }
+  return latest;
+}
+function sourceEntriesAfter(entries, index) {
+  return entries.slice(Math.max(0, index + 1)).filter(isSourceEntry);
+}
+
+// src/consolidate.ts
+function sessionIdOf(ctx) {
+  try {
+    return ctx.sessionManager.getSessionId?.() ?? ctx.sessionManager.getSessionFile?.();
+  } catch {
+    return void 0;
+  }
+}
+async function runTasteConsolidation(pi, runtime, ctx, deps = {}) {
+  runtime.ensureConfig(ctx.cwd);
+  const extract = deps.runExtraction ?? runExtraction;
+  const resolveModel = deps.resolveModel ?? resolveTasteModel;
+  const projectKey = encodeCwd(ctx.cwd);
+  const path = ledgerPath(projectTasteDir(ctx.cwd));
+  const sessionId = sessionIdOf(ctx);
+  const entries = ctx.sessionManager.getBranch();
+  const indexById = entryIndexById(entries);
+  let cursor = latestCoverageIndex(entries);
+  let chunks = 0;
+  let signalsRecorded = 0;
+  let reachedEnd = false;
+  let resolved;
+  let resolvedOnce = false;
+  for (let i = 0; i < runtime.config.consolidateMaxChunks; i++) {
+    const backlog = sourceEntriesAfter(entries, cursor);
+    if (backlog.length === 0) {
+      reachedEnd = true;
+      break;
+    }
+    const { text: chunk, sourceEntryIds, truncatedSourceEntryIds } = serializeSourceAddressedBranchEntries(backlog, {
+      maxTokens: runtime.config.extractChunkMaxTokens
+    });
+    const coversUpToId = sourceEntryIds.at(-1);
+    if (!chunk.trim() || !coversUpToId) {
+      reachedEnd = true;
+      break;
+    }
+    void truncatedSourceEntryIds;
+    if (!resolvedOnce) {
+      resolved = await resolveModel(runtime, {
+        model: ctx.model,
+        modelRegistry: ctx.modelRegistry,
+        stage: "extract",
+        thinkingLevel: ctx.thinkingLevel
+      });
+      resolvedOnce = true;
+    }
+    if (!resolved) throw new Error("no model available for taste extraction");
+    const signals = await extract({
+      model: resolved.model,
+      apiKey: resolved.apiKey,
+      headers: resolved.headers,
+      env: resolved.env,
+      chunk,
+      allowedSourceEntryIds: sourceEntryIds,
+      projectKey,
+      sessionId,
+      maxTurns: runtime.config.agentMaxTurns,
+      maxOutputTokens: runtime.config.agentMaxTokens,
+      thinkingLevel: resolved.thinking,
+      modelRegistry: ctx.modelRegistry
+    });
+    if (signals && signals.length > 0) {
+      const records = signals.map((signal) => ({
+        type: "signal.recorded",
+        at: (/* @__PURE__ */ new Date()).toISOString(),
+        signal
+      }));
+      appendLedger(path, records);
+      signalsRecorded += signals.length;
+    }
+    const data = { coversUpToId, signalCount: signals?.length ?? 0 };
+    pi.appendEntry(TASTE_COVERAGE, data);
+    const next = indexById.get(coversUpToId);
+    if (next === void 0) {
+      reachedEnd = true;
+      break;
+    }
+    cursor = next;
+    chunks++;
+  }
+  return { chunks, signalsRecorded, reachedEnd };
 }
 
 // src/render/taste-section.ts
@@ -395,7 +1029,33 @@ function registerTasteCommand(pi, runtime) {
           return;
         }
         case "consolidate": {
-          ctx.ui.notify("taste: consolidation pipeline not wired up yet", "warning");
+          if (runtime.runInFlight) {
+            ctx.ui.notify("taste: consolidation already running", "warning");
+            return;
+          }
+          runtime.runInFlight = true;
+          runtime.clearStageErrors();
+          try {
+            const summary = await runTasteConsolidation(pi, runtime, {
+              cwd: ctx.cwd,
+              hasUI: ctx.hasUI,
+              ui: ctx.ui,
+              model: ctx.model,
+              modelRegistry: ctx.modelRegistry,
+              thinkingLevel: ctx.thinkingLevel,
+              sessionManager: ctx.sessionManager
+            });
+            const remainder = summary.reachedEnd ? "" : " (more remain; run again)";
+            ctx.ui.notify(
+              `taste: ${summary.signalsRecorded} signal${summary.signalsRecorded === 1 ? "" : "s"} from ${summary.chunks} chunk${summary.chunks === 1 ? "" : "s"}${remainder}`,
+              "info"
+            );
+          } catch (error) {
+            const message = runtime.recordStageError("extract", error);
+            ctx.ui.notify(`taste: consolidation failed: ${message}`, "warning");
+          } finally {
+            runtime.runInFlight = false;
+          }
           return;
         }
         case "status": {
