@@ -19,6 +19,7 @@ var DEFAULTS = {
   injectionConfidenceFloor: 0.5,
   maxInjectedTokens: 1200,
   promoteAtProjectCount: 2,
+  pruneConfidenceFloor: 0.3,
   extractChunkMaxTokens: void 0,
   consolidateMaxChunks: 8,
   agentMaxTurns: 12,
@@ -162,6 +163,8 @@ function normalizeSettingsConfig(value) {
   if (budget !== void 0) normalized.maxInjectedTokens = budget;
   const promote = positiveInteger(value.promoteAtProjectCount);
   if (promote !== void 0) normalized.promoteAtProjectCount = promote;
+  const pruneFloor = probability(value.pruneConfidenceFloor);
+  if (pruneFloor !== void 0) normalized.pruneConfidenceFloor = pruneFloor;
   const extractChunk = positiveInteger(value.extractChunkMaxTokens);
   if (extractChunk !== void 0) normalized.extractChunkMaxTokens = extractChunk;
   const maxChunks = positiveInteger(value.consolidateMaxChunks);
@@ -308,6 +311,7 @@ import { getAgentDir as getAgentDir2 } from "@earendil-works/pi-coding-agent";
 var TASTE_DIR_NAME = "taste";
 var GLOBAL_TASTE_KEY = "global";
 var LEDGER_FILE_NAME = "ledger.ndjson";
+var TASTE_FILE_NAME = "taste.md";
 function encodeCwd(cwd) {
   const resolved = resolve(cwd);
   return `--${resolved.replace(/^[/\\]/u, "").replace(/[/\\:]/gu, "-")}--`;
@@ -323,6 +327,9 @@ function globalTasteDir() {
 }
 function ledgerPath(dir) {
   return join2(dir, LEDGER_FILE_NAME);
+}
+function tasteFilePath(dir) {
+  return join2(dir, TASTE_FILE_NAME);
 }
 
 // src/ledger/store.ts
@@ -1102,6 +1109,139 @@ async function resolveTasteModel(runtime, ctx) {
   };
 }
 
+// src/prune.ts
+var CONTRADICTION_THRESHOLD = 0.5;
+function lowConfidenceRetractions(entries, floor) {
+  return entries.filter((entry) => !entry.explicit && entry.confidence < floor).map((entry) => ({
+    entryId: entry.id,
+    reason: `confidence ${entry.confidence.toFixed(2)} below prune floor ${floor}`
+  }));
+}
+function contradictionKey(a, b) {
+  const [x, y] = [a.id, b.id].sort();
+  return `${x}::${y}::contradicts`;
+}
+function contradictionQuestion(a, b) {
+  return {
+    type: "bool",
+    instructions: [
+      `Two preferences were learned in the same category (${a.category}):`,
+      `A: ${a.content}`,
+      `B: ${b.content}`,
+      "Can both be followed at the same time, or does following one necessarily violate the other?"
+    ].join("\n"),
+    criteria: {
+      true: "Following A and following B cannot both hold; they contradict.",
+      false: "They are compatible, complementary, or about different concerns."
+    }
+  };
+}
+function contradictionPairs(entries, maxPairs) {
+  const byCategory = /* @__PURE__ */ new Map();
+  for (const entry of entries) {
+    const group = byCategory.get(entry.category);
+    if (group) group.push(entry);
+    else byCategory.set(entry.category, [entry]);
+  }
+  const pairs = [];
+  for (const group of byCategory.values()) {
+    const sorted = [...group].sort((a, b) => b.updatedAt.localeCompare(a.updatedAt));
+    for (let i = 0; i < sorted.length; i++) {
+      for (let j = i + 1; j < sorted.length; j++) pairs.push([sorted[i], sorted[j]]);
+    }
+  }
+  if (pairs.length <= maxPairs) return { pairs, truncated: false };
+  return { pairs: pairs.slice(0, maxPairs), truncated: true };
+}
+function pickContradictionLoser(a, b) {
+  if (a.explicit !== b.explicit) return a.explicit ? b : a;
+  const byTime = b.updatedAt.localeCompare(a.updatedAt);
+  if (byTime !== 0) return byTime > 0 ? a : b;
+  return a.confidence <= b.confidence ? a : b;
+}
+async function pruneEntries(options) {
+  const retractions = lowConfidenceRetractions(options.entries, options.confidenceFloor);
+  const retracted = new Set(retractions.map((retraction) => retraction.entryId));
+  let classifierPairs = 0;
+  let classifierTruncated = false;
+  let classifierError;
+  if (options.classifier) {
+    const survivors = options.entries.filter((entry) => !retracted.has(entry.id));
+    const budget = Math.max(1, Math.floor(options.maxQuestionsPerRequest));
+    const { pairs, truncated } = contradictionPairs(survivors, budget);
+    classifierPairs = pairs.length;
+    classifierTruncated = truncated;
+    if (pairs.length > 0) {
+      try {
+        const state = {
+          entries: survivors.map((entry) => ({
+            id: entry.id,
+            category: entry.category,
+            content: entry.content,
+            explicit: entry.explicit,
+            updatedAt: entry.updatedAt
+          }))
+        };
+        const questions = {};
+        for (const [a, b] of pairs) questions[contradictionKey(a, b)] = contradictionQuestion(a, b);
+        const { answers } = await options.classifier(state, questions);
+        for (const [a, b] of pairs) {
+          const answer = answers[contradictionKey(a, b)];
+          if (answer?.type !== "bool" || answer.probability < CONTRADICTION_THRESHOLD) continue;
+          const loser = pickContradictionLoser(a, b);
+          const winner = loser.id === a.id ? b : a;
+          if (retracted.has(loser.id)) continue;
+          retractions.push({ entryId: loser.id, reason: `contradicted by ${winner.id}` });
+          retracted.add(loser.id);
+        }
+      } catch (error) {
+        classifierError = error instanceof Error ? error.message : String(error);
+      }
+    }
+  }
+  return {
+    retractions,
+    classifierPairs,
+    classifierTruncated,
+    ...classifierError ? { classifierError } : {}
+  };
+}
+function retractionRecords(retractions, at) {
+  return retractions.map((retraction) => ({
+    type: "entry.retracted",
+    at,
+    entryId: retraction.entryId,
+    reason: retraction.reason
+  }));
+}
+async function runTastePrune(runtime, args) {
+  runtime.ensureConfig(args.cwd);
+  const path = ledgerPath(projectTasteDir(args.cwd));
+  const active = foldLedger(readLedger(path)).activeEntries;
+  let classifier;
+  if (runtime.config.classifier.mode !== "off") {
+    try {
+      classifier = resolveClassifier(
+        args.modelRegistry,
+        { provider: runtime.config.classifier.provider, model: runtime.config.classifier.model },
+        runtime.config.classifier.requestTimeoutMs
+      );
+    } catch {
+      classifier = void 0;
+    }
+  }
+  const result = await pruneEntries({
+    entries: active,
+    confidenceFloor: runtime.config.pruneConfidenceFloor,
+    ...classifier ? { classifier } : {},
+    maxQuestionsPerRequest: runtime.config.classifier.maxQuestionsPerRequest
+  });
+  if (result.retractions.length > 0) {
+    appendLedger(path, retractionRecords(result.retractions, args.now ?? (/* @__PURE__ */ new Date()).toISOString()));
+  }
+  return { ...result, total: active.length };
+}
+
 // src/reconcile.ts
 import { existsSync as existsSync3, readdirSync } from "node:fs";
 import { join as join4 } from "node:path";
@@ -1128,6 +1268,16 @@ function aggregateAcrossProjects(entryId) {
     confidence = Math.max(confidence, entry.confidence);
   }
   return { projectKeys, confidence };
+}
+function buildGlobalEntry(args) {
+  return {
+    ...args.entry,
+    scope: "global",
+    confidence: clamp012(args.confidence),
+    projectKeys: uniqueStrings(args.projectKeys),
+    createdAt: args.existing?.createdAt ?? args.entry.createdAt,
+    updatedAt: args.now
+  };
 }
 function reconcileCandidate(args) {
   const id = tasteEntryId(args.candidate.content);
@@ -1156,14 +1306,17 @@ function reconcileCandidate(args) {
   if (shouldPromote) {
     const globalPath = ledgerPath(globalTasteDir());
     const globalExisting = foldLedger(readLedger(globalPath)).entriesById.get(id);
-    const globalEntry = {
-      ...entry,
-      scope: "global",
-      confidence: Math.max(confidence, aggregate.confidence),
-      projectKeys: mergedKeys,
-      createdAt: globalExisting?.createdAt ?? entry.createdAt
-    };
-    globalRecords.push({ type: "entry.upserted", at: args.now, entry: globalEntry });
+    globalRecords.push({
+      type: "entry.upserted",
+      at: args.now,
+      entry: buildGlobalEntry({
+        entry,
+        projectKeys: mergedKeys,
+        confidence: Math.max(confidence, aggregate.confidence),
+        now: args.now,
+        ...globalExisting ? { existing: globalExisting } : {}
+      })
+    });
   }
   return { projectRecords, globalRecords, entry };
 }
@@ -1305,7 +1458,51 @@ async function runTasteConsolidation(pi, runtime, ctx, deps = {}) {
     cursor = next;
     chunks++;
   }
-  return { chunks, signalsRecorded, entriesUpserted, reachedEnd };
+  let entriesRetracted = 0;
+  try {
+    const pruned = await runTastePrune(runtime, { cwd: ctx.cwd, modelRegistry: ctx.modelRegistry });
+    entriesRetracted = pruned.retractions.length;
+  } catch (error) {
+    runtime.recordStageError("prune", error);
+  }
+  return { chunks, signalsRecorded, entriesUpserted, entriesRetracted, reachedEnd };
+}
+
+// src/export.ts
+import { mkdirSync as mkdirSync4, writeFileSync as writeFileSync2 } from "node:fs";
+import { dirname as dirname3 } from "node:path";
+
+// src/render/taste-markdown.ts
+function renderTasteMarkdown(entries, options) {
+  const sorted = [...entries].sort(
+    (a, b) => a.category.localeCompare(b.category) || b.confidence - a.confidence
+  );
+  const lines = [
+    `# ${options.title}`,
+    "",
+    "<!-- Generated by pi-taste from the append-only ledger. Edits are overwritten. -->"
+  ];
+  if (options.generatedAt) lines.push("", `Updated: ${options.generatedAt}`);
+  if (sorted.length === 0) {
+    lines.push("", "_No preferences recorded yet._");
+    return `${lines.join("\n")}
+`;
+  }
+  const byCategory = /* @__PURE__ */ new Map();
+  for (const entry of sorted) {
+    const group = byCategory.get(entry.category);
+    if (group) group.push(entry);
+    else byCategory.set(entry.category, [entry]);
+  }
+  for (const [category, group] of byCategory) {
+    lines.push("", `## ${category}`);
+    for (const entry of group) {
+      const scope = entry.scope === "global" ? ", global" : "";
+      lines.push(`- ${entry.content} (${Math.round(entry.confidence * 100)}%${entry.explicit ? ", explicit" : ""}${scope})`);
+    }
+  }
+  return `${lines.join("\n")}
+`;
 }
 
 // src/render/taste-section.ts
@@ -1337,6 +1534,69 @@ ${lines.join("\n")}
 </taste>`;
 }
 
+// src/export.ts
+function writeMarkdown(path, content) {
+  mkdirSync4(dirname3(path), { recursive: true });
+  writeFileSync2(path, content, "utf-8");
+}
+function exportTasteMarkdown(cwd) {
+  const projectEntries2 = foldLedger(readLedger(ledgerPath(projectTasteDir(cwd)))).activeEntries;
+  const globalEntries2 = foldLedger(readLedger(ledgerPath(globalTasteDir()))).activeEntries;
+  const generatedAt = (/* @__PURE__ */ new Date()).toISOString();
+  const projectPath = tasteFilePath(projectTasteDir(cwd));
+  const globalPath = tasteFilePath(globalTasteDir());
+  writeMarkdown(
+    projectPath,
+    renderTasteMarkdown(mergeTasteEntries(projectEntries2, globalEntries2), {
+      title: `Taste: ${encodeCwd(cwd)}`,
+      generatedAt
+    })
+  );
+  writeMarkdown(globalPath, renderTasteMarkdown(globalEntries2, { title: "Global taste", generatedAt }));
+  return {
+    projectPath,
+    globalPath,
+    projectCount: projectEntries2.length,
+    globalCount: globalEntries2.length
+  };
+}
+
+// src/time.ts
+function pad2(n) {
+  return n.toString().padStart(2, "0");
+}
+function localTimestamp(date = /* @__PURE__ */ new Date()) {
+  return `${date.getFullYear()}-${pad2(date.getMonth() + 1)}-${pad2(date.getDate())} ${pad2(date.getHours())}:${pad2(date.getMinutes())}`;
+}
+
+// src/remember.ts
+var REMEMBER_SOURCE_ID = "user:taste-remember";
+function rememberPreference(args) {
+  const date = args.now ?? /* @__PURE__ */ new Date();
+  const at = date.toISOString();
+  const projectKey = encodeCwd(args.cwd);
+  const content = args.text.trim();
+  const signal = {
+    id: tasteEntryId(content),
+    content,
+    timestamp: localTimestamp(date),
+    kind: "explicit",
+    projectKey,
+    sourceEntryIds: [REMEMBER_SOURCE_ID],
+    ...args.sessionId ? { sessionId: args.sessionId } : {}
+  };
+  const { projectRecords, globalRecords, entry } = reconcileCandidate({
+    cwd: args.cwd,
+    candidate: { content, category: "general", confidence: 1, explicit: true, general: false, signal },
+    projectKey,
+    promoteAtProjectCount: args.promoteAtProjectCount,
+    now: at
+  });
+  appendLedger(ledgerPath(projectTasteDir(args.cwd)), [{ type: "signal.recorded", at, signal }, ...projectRecords]);
+  if (globalRecords.length > 0) appendLedger(ledgerPath(globalTasteDir()), globalRecords);
+  return { signal, entry, globalRecords };
+}
+
 // src/taste-snapshot.ts
 function refreshTasteSnapshot(runtime, cwd) {
   runtime.ensureConfig(cwd);
@@ -1355,7 +1615,8 @@ function refreshTasteSnapshot(runtime, cwd) {
 
 // src/commands/taste.ts
 var HELP = [
-  "taste: status | enable [--user] | disable [--user] | view | consolidate"
+  "taste: status | enable [--user] | disable [--user] | view | consolidate | prune",
+  "       remember <text> | forget <text|id> | promote <text|id> | export"
 ].join("\n");
 function parseArgs(args) {
   const all = args.trim().split(/\s+/u).filter(Boolean);
@@ -1367,6 +1628,19 @@ function projectEntries(cwd) {
 }
 function globalEntries() {
   return foldLedger(readLedger(ledgerPath(globalTasteDir()))).activeEntries;
+}
+function findEntry(entries, selector) {
+  const needle = normalizeTasteContent(selector);
+  if (!needle) return void 0;
+  return entries.find((entry) => entry.id === selector) ?? entries.find((entry) => selector.length >= 6 && entry.id.startsWith(selector)) ?? entries.find((entry) => normalizeTasteContent(entry.content) === needle) ?? entries.find((entry) => normalizeTasteContent(entry.content).includes(needle));
+}
+function commandSessionId(ctx) {
+  const manager = ctx.sessionManager;
+  try {
+    return manager?.getSessionId?.();
+  } catch {
+    return void 0;
+  }
 }
 function statusText(runtime, cwd) {
   const project = projectEntries(cwd);
@@ -1380,6 +1654,7 @@ function statusText(runtime, cwd) {
     `project: ${project.length} entries \u2014 ${projectTasteDir(cwd)}`,
     `global: ${global.length} entries \u2014 ${globalTasteDir()}`,
     `injectable: ${eligible.length} (floor ${runtime.config.injectionConfidenceFloor})`,
+    `prune: inferred entries below ${runtime.config.pruneConfidenceFloor}`,
     `classifier: ${classifier.mode} via ${classifier.provider}${classifier.model ? `/${classifier.model}` : ""}`
   ].join("\n");
 }
@@ -1392,11 +1667,12 @@ function viewText(runtime, cwd) {
 }
 function registerTasteCommand(pi, runtime) {
   pi.registerCommand("taste", {
-    description: "Taste: status, enable/disable, view, consolidate",
+    description: "Taste: status, enable/disable, view, consolidate, prune, remember, forget, promote, export",
     handler: async (args, ctx) => {
       runtime.ensureConfig(ctx.cwd);
       const { parts, user } = parseArgs(args);
       const sub = parts[0] ?? "status";
+      const selector = parts.slice(1).join(" ").trim();
       switch (sub) {
         case "enable":
         case "disable": {
@@ -1410,6 +1686,82 @@ function registerTasteCommand(pi, runtime) {
         }
         case "view": {
           ctx.ui.notify(viewText(runtime, ctx.cwd), "info");
+          return;
+        }
+        case "remember": {
+          if (!selector) {
+            ctx.ui.notify("taste: remember <text>", "warning");
+            return;
+          }
+          const sessionId = commandSessionId(ctx);
+          rememberPreference({
+            cwd: ctx.cwd,
+            text: selector,
+            promoteAtProjectCount: runtime.config.promoteAtProjectCount,
+            ...sessionId ? { sessionId } : {}
+          });
+          ctx.ui.notify(`taste: recorded "${selector}" (100%, explicit)`, "info");
+          return;
+        }
+        case "forget": {
+          const entry = findEntry(projectEntries(ctx.cwd), selector) ?? findEntry(globalEntries(), selector);
+          if (!entry) {
+            ctx.ui.notify(`taste: no entry matching "${selector}"`, "warning");
+            return;
+          }
+          const path = ledgerPath(entry.scope === "global" ? globalTasteDir() : projectTasteDir(ctx.cwd));
+          appendLedger(path, [
+            { type: "entry.retracted", at: (/* @__PURE__ */ new Date()).toISOString(), entryId: entry.id, reason: "forgotten by user" }
+          ]);
+          ctx.ui.notify(`taste: forgot "${entry.content}"`, "info");
+          return;
+        }
+        case "promote": {
+          const entry = findEntry(projectEntries(ctx.cwd), selector) ?? findEntry(globalEntries(), selector);
+          if (!entry) {
+            ctx.ui.notify(`taste: no entry matching "${selector}"`, "warning");
+            return;
+          }
+          const aggregate = aggregateAcrossProjects(entry.id);
+          const projectKeys = [...aggregate.projectKeys, ...entry.projectKeys];
+          const globalPath = ledgerPath(globalTasteDir());
+          const existing = foldLedger(readLedger(globalPath)).entriesById.get(entry.id);
+          const at = (/* @__PURE__ */ new Date()).toISOString();
+          appendLedger(globalPath, [
+            {
+              type: "entry.upserted",
+              at,
+              entry: buildGlobalEntry({
+                entry,
+                projectKeys,
+                confidence: Math.max(entry.confidence, aggregate.confidence),
+                now: at,
+                ...existing ? { existing } : {}
+              })
+            }
+          ]);
+          ctx.ui.notify(`taste: promoted "${entry.content}" to global`, "info");
+          return;
+        }
+        case "export": {
+          const result = exportTasteMarkdown(ctx.cwd);
+          ctx.ui.notify(
+            `taste: wrote ${result.projectPath} (${result.projectCount}) and ${result.globalPath} (${result.globalCount})`,
+            "info"
+          );
+          return;
+        }
+        case "prune": {
+          try {
+            const result = await runTastePrune(runtime, { cwd: ctx.cwd, modelRegistry: ctx.modelRegistry });
+            const classifierNote = result.classifierError ? ` (classifier unavailable: ${result.classifierError})` : "";
+            ctx.ui.notify(
+              `taste: retracted ${result.retractions.length} of ${result.total} entries${classifierNote}`,
+              "info"
+            );
+          } catch (error) {
+            ctx.ui.notify(`taste: prune failed: ${runtime.recordStageError("prune", error)}`, "warning");
+          }
           return;
         }
         case "consolidate": {
@@ -1431,7 +1783,7 @@ function registerTasteCommand(pi, runtime) {
             });
             const remainder = summary.reachedEnd ? "" : " (more remain; run again)";
             ctx.ui.notify(
-              `taste: ${summary.signalsRecorded} signal${summary.signalsRecorded === 1 ? "" : "s"}, ${summary.entriesUpserted} entr${summary.entriesUpserted === 1 ? "y" : "ies"} from ${summary.chunks} chunk${summary.chunks === 1 ? "" : "s"}${remainder}`,
+              `taste: ${summary.signalsRecorded} signal${summary.signalsRecorded === 1 ? "" : "s"}, ${summary.entriesUpserted} entr${summary.entriesUpserted === 1 ? "y" : "ies"}, ${summary.entriesRetracted} retracted from ${summary.chunks} chunk${summary.chunks === 1 ? "" : "s"}${remainder}`,
               "info"
             );
           } catch (error) {
