@@ -239,6 +239,9 @@ function setTasteEnabled(args) {
   return path;
 }
 
+// src/consolidate.ts
+import { basename } from "node:path";
+
 // src/agents/extract/agent.ts
 import { agentLoop } from "@earendil-works/pi-agent-core";
 import { Type } from "@earendil-works/pi-ai";
@@ -254,6 +257,9 @@ var SIGNAL_KINDS = ["stated", "correction", "explicit"];
 var TASTE_SCOPES = ["project", "global"];
 function normalizeTasteContent(content) {
   return content.trim().toLowerCase().replace(/\s+/gu, " ").replace(/[.!?]+$/u, "");
+}
+function tasteEntryId(content) {
+  return hashId(normalizeTasteContent(content));
 }
 function isRecord2(value) {
   return typeof value === "object" && value !== null;
@@ -742,6 +748,293 @@ ${conversation}`;
   return Array.from(accumulated.values());
 }
 
+// src/agents/distill/classifier.ts
+var DEFAULT_CLASSIFIER_PROVIDER = "local-jev";
+function findClassifierModel(registry, selection) {
+  const provider = selection.provider || DEFAULT_CLASSIFIER_PROVIDER;
+  if (selection.model) {
+    return registry.findOfType("classifier", provider, selection.model) ?? registry.getModelsOfType("classifier", provider).find((model) => model.id === selection.model);
+  }
+  return registry.getModelsOfType("classifier", provider)[0];
+}
+function resolveClassifier(registry, selection, timeoutMs) {
+  if (!registry) return void 0;
+  const model = findClassifierModel(registry, selection);
+  if (!model) return void 0;
+  return async (state, questions) => {
+    const result = await registry.classify(model, { state, questions }, { timeoutMs });
+    if (result.stopReason !== "stop") {
+      throw new Error(
+        `System One classification via ${model.provider}/${model.id} failed: ${result.errorMessage ?? result.stopReason}`
+      );
+    }
+    return { answers: result.answers, usage: result.usage };
+  };
+}
+
+// src/agents/distill/questions.ts
+var TASTE_CATEGORIES = {
+  formatting: "Whitespace, line width, quoting, and other purely stylistic conventions.",
+  naming: "Identifier, file, and symbol naming conventions.",
+  architecture: "Module boundaries, layering, abstraction, and code structure.",
+  typescript: "TypeScript and JavaScript typing and language usage.",
+  python: "Python-specific idioms and tooling.",
+  testing: "Test frameworks, structure, coverage, and what to test.",
+  "error-handling": "How errors, failures, and edge cases are handled.",
+  tooling: "Build tools, package managers, linters, formatters, CI.",
+  dependencies: "When and how to add or avoid dependencies.",
+  "api-design": "Function, module, and interface signatures.",
+  workflow: "How work is done: commits, branches, reviews, planning.",
+  communication: "How the assistant should talk: verbosity, format, tone.",
+  general: "A durable preference that fits none of the above."
+};
+var SIGNAL_KEYS = ["is_preference", "category", "explicit", "confidence", "general"];
+var CONFIDENCE_LEVELS = [
+  "Weak: mentioned once, ambiguously, or in passing.",
+  "Moderate: clearly stated once.",
+  "Strong: stated clearly and emphasized, or repeated."
+];
+function questionKey(signalId, key) {
+  return `${signalId}::${key}`;
+}
+function parseQuestionKey(key) {
+  const separator = key.lastIndexOf("::");
+  if (separator <= 0) return void 0;
+  const signalKey = key.slice(separator + 2);
+  if (!SIGNAL_KEYS.includes(signalKey)) return void 0;
+  return { signalId: key.slice(0, separator), signalKey };
+}
+function buildDistillState(input) {
+  return {
+    project: input.project,
+    signals: input.signals.map((signal) => ({
+      id: signal.id,
+      kind: signal.kind,
+      content: signal.content
+    }))
+  };
+}
+function about(signalId, question) {
+  return `Consider the entry in \`signals\` whose id is \`${signalId}\`. ${question}`;
+}
+function buildDistillQuestions(signalId) {
+  return {
+    [questionKey(signalId, "is_preference")]: {
+      type: "bool",
+      instructions: about(
+        signalId,
+        "Is this a durable, generalizable preference about how code or work should be done, rather than a one-off task detail that will not matter in a later session?"
+      ),
+      criteria: {
+        true: "It states or corrects how something should be done, in a way that outlives this task.",
+        false: "It is a request about this specific task, file, or bug and carries no lasting preference."
+      }
+    },
+    [questionKey(signalId, "category")]: {
+      type: "choice",
+      instructions: about(signalId, "Which single category best fits the preference?"),
+      criteria: TASTE_CATEGORIES
+    },
+    [questionKey(signalId, "explicit")]: {
+      type: "bool",
+      instructions: about(signalId, "Did the user state this preference directly, rather than it being only implied?"),
+      criteria: {
+        true: "The user said or corrected it themselves.",
+        false: "It is inferred from context rather than stated."
+      }
+    },
+    [questionKey(signalId, "confidence")]: {
+      type: "score",
+      instructions: about(signalId, "How strongly does the conversation support this preference as the user's actual taste?"),
+      criteria: CONFIDENCE_LEVELS
+    },
+    [questionKey(signalId, "general")]: {
+      type: "bool",
+      instructions: about(
+        signalId,
+        "Is this a general working style likely to apply across projects, rather than specific to this project's stack or constraints?"
+      ),
+      criteria: {
+        true: "It is about how the user works, independent of this codebase.",
+        false: "It depends on this project's stack, conventions, or constraints."
+      }
+    }
+  };
+}
+function answerNumber(answer, levels) {
+  if (!answer) return void 0;
+  if (answer.type === "bool") return Number.isFinite(answer.probability) ? answer.probability : void 0;
+  if (answer.type === "score" && Number.isFinite(answer.score)) {
+    return answer.score / Math.max(1, levels - 1);
+  }
+  return void 0;
+}
+function collectAnswers(answers) {
+  const partial = /* @__PURE__ */ new Map();
+  for (const [key, answer] of Object.entries(answers)) {
+    const parsed = parseQuestionKey(key);
+    if (!parsed) continue;
+    const current = partial.get(parsed.signalId) ?? {};
+    if (parsed.signalKey === "category") {
+      if (answer.type === "choice" && typeof answer.choice === "string") current.category = answer.choice;
+    } else if (parsed.signalKey === "confidence") {
+      const value = answerNumber(answer, CONFIDENCE_LEVELS.length);
+      if (value !== void 0) current.confidence = Math.min(1, Math.max(0, value));
+    } else {
+      const value = answerNumber(answer, 2);
+      if (value !== void 0) current[parsed.signalKey] = Math.min(1, Math.max(0, value));
+    }
+    partial.set(parsed.signalId, current);
+  }
+  const complete = /* @__PURE__ */ new Map();
+  for (const [signalId, value] of partial) {
+    if (value.is_preference !== void 0 && value.category !== void 0 && value.confidence !== void 0) {
+      complete.set(signalId, value);
+    }
+  }
+  return complete;
+}
+
+// src/agents/distill/scores.ts
+import { appendFileSync as appendFileSync2, mkdirSync as mkdirSync3 } from "node:fs";
+import { join as join3 } from "node:path";
+var SAFE_SESSION_ID = /[^a-zA-Z0-9._-]+/gu;
+function safeSessionId(sessionId) {
+  if (!sessionId) return "unknown-session";
+  const safe = sessionId.replace(SAFE_SESSION_ID, "_").slice(0, 120);
+  return safe.length > 0 ? safe : "unknown-session";
+}
+function distillScoresPath(sessionId) {
+  return join3(tasteRootDir(), "distill-scores", `${safeSessionId(sessionId)}.ndjson`);
+}
+function appendDistillScores(sessionId, rows) {
+  if (rows.length === 0) return false;
+  try {
+    const path = distillScoresPath(sessionId);
+    mkdirSync3(join3(tasteRootDir(), "distill-scores"), { recursive: true });
+    appendFileSync2(path, `${rows.map((row) => JSON.stringify(row)).join("\n")}
+`, "utf-8");
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+// src/agents/distill/index.ts
+function clamp01(value) {
+  return Math.min(1, Math.max(0, value));
+}
+function heuristicDecision(signal) {
+  const confidence = signal.kind === "explicit" ? 0.95 : signal.kind === "stated" ? 0.7 : 0.65;
+  return {
+    isPreference: true,
+    category: "general",
+    confidence,
+    explicit: true,
+    general: false,
+    source: "heuristic"
+  };
+}
+function decisionFromAnswers(answers, preferenceThreshold) {
+  if (answers.is_preference === void 0 || answers.is_preference < preferenceThreshold) return void 0;
+  return {
+    isPreference: true,
+    category: answers.category ?? "general",
+    confidence: clamp01(answers.confidence ?? 0.5),
+    explicit: (answers.explicit ?? 0) >= 0.5,
+    general: (answers.general ?? 0) >= 0.5,
+    source: "classifier"
+  };
+}
+function chunked(items, size) {
+  const chunks = [];
+  for (let i = 0; i < items.length; i += size) chunks.push(items.slice(i, i + size));
+  return chunks;
+}
+async function classifySignals(args) {
+  const { classifier, state, signals, config } = args;
+  const decisions = /* @__PURE__ */ new Map();
+  if (!classifier || signals.length === 0) return decisions;
+  const perChunk = Math.max(1, Math.floor(config.maxQuestionsPerRequest / SIGNAL_KEYS.length));
+  for (const chunk of chunked(signals, perChunk)) {
+    const questions = {};
+    for (const signal of chunk) Object.assign(questions, buildDistillQuestions(signal.id));
+    const { answers } = await classifier(state, questions);
+    for (const [signalId, values] of collectAnswers(answers)) {
+      const decision = decisionFromAnswers(values, config.preferenceThreshold);
+      if (decision) decisions.set(signalId, decision);
+    }
+  }
+  return decisions;
+}
+async function distillSignals(options) {
+  const { signals, config } = options;
+  if (signals.length === 0) return [];
+  const heuristic = /* @__PURE__ */ new Map();
+  for (const signal of signals) heuristic.set(signal.id, heuristicDecision(signal));
+  let classifierDecisions = /* @__PURE__ */ new Map();
+  let classifierUsed = false;
+  if (config.mode !== "off") {
+    try {
+      const classifier = resolveClassifier(options.registry, {
+        provider: config.provider,
+        model: config.model
+      }, config.requestTimeoutMs);
+      if (classifier) {
+        classifierDecisions = await classifySignals({
+          classifier,
+          state: buildDistillState({ project: options.project, signals }),
+          signals,
+          config
+        });
+        classifierUsed = true;
+      }
+    } catch {
+      classifierUsed = false;
+    }
+  }
+  const chosen = config.mode === "primary" && classifierUsed ? classifierDecisions : heuristic;
+  const candidates = [];
+  const rows = [];
+  const ts = (/* @__PURE__ */ new Date()).toISOString();
+  for (const signal of signals) {
+    const heuristicDecisionForKey = heuristic.get(signal.id);
+    if (!heuristicDecisionForKey) continue;
+    const decision = chosen.get(signal.id) ?? heuristicDecisionForKey;
+    candidates.push({
+      content: signal.content,
+      category: decision.category,
+      confidence: decision.confidence,
+      explicit: decision.explicit,
+      general: decision.general,
+      signal
+    });
+    if (classifierUsed) {
+      const classifierDecision = classifierDecisions.get(signal.id);
+      rows.push({
+        ts,
+        ...options.sessionId ? { sessionId: options.sessionId } : {},
+        signalId: signal.id,
+        mode: config.mode,
+        ...classifierDecision ? { classifier: toRow(classifierDecision) } : {},
+        heuristic: toRow(heuristicDecisionForKey),
+        applied: decision.source
+      });
+    }
+  }
+  appendDistillScores(options.sessionId, rows);
+  return candidates;
+}
+function toRow(decision) {
+  return {
+    isPreference: decision.isPreference,
+    category: decision.category,
+    confidence: decision.confidence,
+    explicit: decision.explicit,
+    general: decision.general
+  };
+}
+
 // src/model-resolver.ts
 function usableHeaderCount(headers) {
   if (!headers || typeof headers !== "object") return 0;
@@ -809,6 +1102,72 @@ async function resolveTasteModel(runtime, ctx) {
   };
 }
 
+// src/reconcile.ts
+import { existsSync as existsSync3, readdirSync } from "node:fs";
+import { join as join4 } from "node:path";
+function clamp012(value) {
+  return Math.min(1, Math.max(0, value));
+}
+function combineConfidence(previous, next) {
+  if (previous === void 0) return clamp012(next);
+  return clamp012(1 - (1 - previous) * (1 - next));
+}
+function uniqueStrings(values) {
+  return [...new Set(values)];
+}
+function aggregateAcrossProjects(entryId) {
+  const root = tasteRootDir();
+  if (!existsSync3(root)) return { projectKeys: [], confidence: 0 };
+  const projectKeys = [];
+  let confidence = 0;
+  for (const dirent of readdirSync(root, { withFileTypes: true })) {
+    if (!dirent.isDirectory() || dirent.name === GLOBAL_TASTE_KEY) continue;
+    const entry = foldLedger(readLedger(ledgerPath(join4(root, dirent.name)))).entriesById.get(entryId);
+    if (!entry) continue;
+    projectKeys.push(...entry.projectKeys);
+    confidence = Math.max(confidence, entry.confidence);
+  }
+  return { projectKeys, confidence };
+}
+function reconcileCandidate(args) {
+  const id = tasteEntryId(args.candidate.content);
+  const projectPath = ledgerPath(projectTasteDir(args.cwd));
+  const existing = foldLedger(readLedger(projectPath)).entriesById.get(id);
+  const signalIds = uniqueStrings([...existing?.signalIds ?? [], args.candidate.signal.id]);
+  const projectKeys = uniqueStrings([...existing?.projectKeys ?? [], args.projectKey]);
+  const confidence = combineConfidence(existing?.confidence, args.candidate.confidence);
+  const entry = {
+    id,
+    content: args.candidate.content,
+    category: args.candidate.category,
+    confidence,
+    explicit: (existing?.explicit ?? false) || args.candidate.explicit,
+    scope: "project",
+    signalIds,
+    projectKeys,
+    createdAt: existing?.createdAt ?? args.now,
+    updatedAt: args.now
+  };
+  const projectRecords = [{ type: "entry.upserted", at: args.now, entry }];
+  const aggregate = aggregateAcrossProjects(id);
+  const mergedKeys = uniqueStrings([...aggregate.projectKeys, ...projectKeys]);
+  const shouldPromote = args.candidate.general || mergedKeys.length >= args.promoteAtProjectCount;
+  const globalRecords = [];
+  if (shouldPromote) {
+    const globalPath = ledgerPath(globalTasteDir());
+    const globalExisting = foldLedger(readLedger(globalPath)).entriesById.get(id);
+    const globalEntry = {
+      ...entry,
+      scope: "global",
+      confidence: Math.max(confidence, aggregate.confidence),
+      projectKeys: mergedKeys,
+      createdAt: globalExisting?.createdAt ?? entry.createdAt
+    };
+    globalRecords.push({ type: "entry.upserted", at: args.now, entry: globalEntry });
+  }
+  return { projectRecords, globalRecords, entry };
+}
+
 // src/session/coverage.ts
 var TASTE_COVERAGE = "taste.coverage";
 var SOURCE_ENTRY_TYPES = /* @__PURE__ */ new Set(["message", "custom_message", "branch_summary"]);
@@ -860,6 +1219,7 @@ async function runTasteConsolidation(pi, runtime, ctx, deps = {}) {
   let cursor = latestCoverageIndex(entries);
   let chunks = 0;
   let signalsRecorded = 0;
+  let entriesUpserted = 0;
   let reachedEnd = false;
   let resolved;
   let resolvedOnce = false;
@@ -910,6 +1270,30 @@ async function runTasteConsolidation(pi, runtime, ctx, deps = {}) {
       }));
       appendLedger(path, records);
       signalsRecorded += signals.length;
+      try {
+        const candidates = await distillSignals({
+          signals,
+          project: basename(ctx.cwd),
+          config: runtime.config.classifier,
+          registry: ctx.modelRegistry,
+          sessionId
+        });
+        const now = (/* @__PURE__ */ new Date()).toISOString();
+        for (const candidate of candidates) {
+          const { projectRecords, globalRecords } = reconcileCandidate({
+            cwd: ctx.cwd,
+            candidate,
+            projectKey,
+            promoteAtProjectCount: runtime.config.promoteAtProjectCount,
+            now
+          });
+          appendLedger(path, projectRecords);
+          if (globalRecords.length > 0) appendLedger(ledgerPath(globalTasteDir()), globalRecords);
+          entriesUpserted += 1;
+        }
+      } catch (error) {
+        runtime.recordStageError("distill", error);
+      }
     }
     const data = { coversUpToId, signalCount: signals?.length ?? 0 };
     pi.appendEntry(TASTE_COVERAGE, data);
@@ -921,7 +1305,7 @@ async function runTasteConsolidation(pi, runtime, ctx, deps = {}) {
     cursor = next;
     chunks++;
   }
-  return { chunks, signalsRecorded, reachedEnd };
+  return { chunks, signalsRecorded, entriesUpserted, reachedEnd };
 }
 
 // src/render/taste-section.ts
@@ -1047,7 +1431,7 @@ function registerTasteCommand(pi, runtime) {
             });
             const remainder = summary.reachedEnd ? "" : " (more remain; run again)";
             ctx.ui.notify(
-              `taste: ${summary.signalsRecorded} signal${summary.signalsRecorded === 1 ? "" : "s"} from ${summary.chunks} chunk${summary.chunks === 1 ? "" : "s"}${remainder}`,
+              `taste: ${summary.signalsRecorded} signal${summary.signalsRecorded === 1 ? "" : "s"}, ${summary.entriesUpserted} entr${summary.entriesUpserted === 1 ? "y" : "ies"} from ${summary.chunks} chunk${summary.chunks === 1 ? "" : "s"}${remainder}`,
               "info"
             );
           } catch (error) {
