@@ -72,6 +72,8 @@ export interface Config {
 	maxInjectedTokens: number;
 	/** Promote a preference to the global ledger once seen in this many projects. */
 	promoteAtProjectCount: number;
+	/** Inferred entries below this confidence are pruned; explicit entries are exempt. */
+	pruneConfidenceFloor: number;
 	/** Estimated token cap for one extraction chunk. Unset derives ~1/5 of the model window. */
 	extractChunkMaxTokens?: number;
 	/** Maximum extraction chunks one `/taste consolidate` run may process. */
@@ -92,6 +94,7 @@ export const DEFAULTS: Config = {
 	injectionConfidenceFloor: 0.5,
 	maxInjectedTokens: 1_200,
 	promoteAtProjectCount: 2,
+	pruneConfidenceFloor: 0.3,
 	extractChunkMaxTokens: undefined,
 	consolidateMaxChunks: 8,
 	agentMaxTurns: 12,
@@ -273,6 +276,8 @@ function normalizeSettingsConfig(value: Record<string, unknown>): NormalizedSett
 	if (budget !== undefined) normalized.maxInjectedTokens = budget;
 	const promote = positiveInteger(value.promoteAtProjectCount);
 	if (promote !== undefined) normalized.promoteAtProjectCount = promote;
+	const pruneFloor = probability(value.pruneConfidenceFloor);
+	if (pruneFloor !== undefined) normalized.pruneConfidenceFloor = pruneFloor;
 	const extractChunk = positiveInteger(value.extractChunkMaxTokens);
 	if (extractChunk !== undefined) normalized.extractChunkMaxTokens = extractChunk;
 	const maxChunks = positiveInteger(value.consolidateMaxChunks);
