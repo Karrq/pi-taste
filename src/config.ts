@@ -72,6 +72,12 @@ export interface Config {
 	maxInjectedTokens: number;
 	/** Promote a preference to the global ledger once seen in this many projects. */
 	promoteAtProjectCount: number;
+	/** Estimated token cap for one extraction chunk. Unset derives ~1/5 of the model window. */
+	extractChunkMaxTokens?: number;
+	/** Maximum extraction chunks one `/taste consolidate` run may process. */
+	consolidateMaxChunks: number;
+	agentMaxTurns: number;
+	agentMaxTokens: number;
 	model?: ConfiguredModel;
 	fallbackModel?: ConfiguredModel;
 	modelMap: ModelMapEntry[];
@@ -86,6 +92,10 @@ export const DEFAULTS: Config = {
 	injectionConfidenceFloor: 0.5,
 	maxInjectedTokens: 1_200,
 	promoteAtProjectCount: 2,
+	extractChunkMaxTokens: undefined,
+	consolidateMaxChunks: 8,
+	agentMaxTurns: 12,
+	agentMaxTokens: 16_000,
 	modelMap: [],
 	debugLog: false,
 	passive: false,
@@ -263,6 +273,14 @@ function normalizeSettingsConfig(value: Record<string, unknown>): NormalizedSett
 	if (budget !== undefined) normalized.maxInjectedTokens = budget;
 	const promote = positiveInteger(value.promoteAtProjectCount);
 	if (promote !== undefined) normalized.promoteAtProjectCount = promote;
+	const extractChunk = positiveInteger(value.extractChunkMaxTokens);
+	if (extractChunk !== undefined) normalized.extractChunkMaxTokens = extractChunk;
+	const maxChunks = positiveInteger(value.consolidateMaxChunks);
+	if (maxChunks !== undefined) normalized.consolidateMaxChunks = maxChunks;
+	const agentMaxTurns = positiveInteger(value.agentMaxTurns);
+	if (agentMaxTurns !== undefined) normalized.agentMaxTurns = agentMaxTurns;
+	const agentMaxTokens = positiveInteger(value.agentMaxTokens);
+	if (agentMaxTokens !== undefined) normalized.agentMaxTokens = agentMaxTokens;
 	const model = normalizeModel(value.model);
 	if (model) normalized.model = model;
 	const fallbackModel = normalizeModel(value.fallbackModel);

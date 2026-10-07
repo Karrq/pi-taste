@@ -1,5 +1,6 @@
 import type { ExtensionAPI, ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
 import { setTasteEnabled } from "../config.js";
+import { runTasteConsolidation } from "../consolidate.js";
 import { foldLedger } from "../ledger/fold.js";
 import { globalTasteDir, ledgerPath, projectTasteDir } from "../ledger/paths.js";
 import { readLedger } from "../ledger/store.js";
@@ -75,9 +76,35 @@ export function registerTasteCommand(pi: ExtensionAPI, runtime: Runtime): void {
 					return;
 				}
 				case "consolidate": {
-					// The extraction -> distill -> reconcile -> prune pipeline is the next
-					// build step; the command exists now so the surface is stable.
-					ctx.ui.notify("taste: consolidation pipeline not wired up yet", "warning");
+					if (runtime.runInFlight) {
+						ctx.ui.notify("taste: consolidation already running", "warning");
+						return;
+					}
+					runtime.runInFlight = true;
+					runtime.clearStageErrors();
+					try {
+						const summary = await runTasteConsolidation(pi, runtime, {
+							cwd: ctx.cwd,
+							hasUI: ctx.hasUI,
+							ui: ctx.ui,
+							model: ctx.model,
+							modelRegistry: ctx.modelRegistry,
+							thinkingLevel: ctx.thinkingLevel,
+							sessionManager: ctx.sessionManager,
+						});
+						// Explicit consolidation writes the ledger but deliberately does not
+						// refresh the injected snapshot; that happens at the next compaction.
+						const remainder = summary.reachedEnd ? "" : " (more remain; run again)";
+						ctx.ui.notify(
+							`taste: ${summary.signalsRecorded} signal${summary.signalsRecorded === 1 ? "" : "s"} from ${summary.chunks} chunk${summary.chunks === 1 ? "" : "s"}${remainder}`,
+							"info",
+						);
+					} catch (error) {
+						const message = runtime.recordStageError("extract", error);
+						ctx.ui.notify(`taste: consolidation failed: ${message}`, "warning");
+					} finally {
+						runtime.runInFlight = false;
+					}
 					return;
 				}
 				case "status": {
