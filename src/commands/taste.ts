@@ -96,7 +96,8 @@ export function registerTasteCommand(pi: ExtensionAPI, runtime: Runtime): void {
 						// refresh the injected snapshot; that happens at the next compaction.
 						const remainder = summary.reachedEnd ? "" : " (more remain; run again)";
 						ctx.ui.notify(
-							`taste: ${summary.signalsRecorded} signal${summary.signalsRecorded === 1 ? "" : "s"} from ${summary.chunks} chunk${summary.chunks === 1 ? "" : "s"}${remainder}`,
+							`taste: ${summary.signalsRecorded} signal${summary.signalsRecorded === 1 ? "" : "s"}, `
+							+ `${summary.entriesUpserted} entr${summary.entriesUpserted === 1 ? "y" : "ies"} from ${summary.chunks} chunk${summary.chunks === 1 ? "" : "s"}${remainder}`,
 							"info",
 						);
 					} catch (error) {

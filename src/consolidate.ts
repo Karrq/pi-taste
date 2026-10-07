@@ -1,11 +1,15 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import type { ModelThinkingLevel } from "@earendil-works/pi-ai";
+import { basename } from "node:path";
 import { runExtraction } from "./agents/extract/agent.js";
+import { distillSignals } from "./agents/distill/index.js";
+import type { ClassifierRegistry } from "./agents/distill/classifier.js";
 import { encodeCwd } from "./ledger/paths.js";
 import { appendLedger } from "./ledger/store.js";
 import type { LedgerRecord } from "./ledger/types.js";
-import { ledgerPath, projectTasteDir } from "./ledger/paths.js";
+import { globalTasteDir, ledgerPath, projectTasteDir } from "./ledger/paths.js";
 import { resolveTasteModel } from "./model-resolver.js";
+import { reconcileCandidate } from "./reconcile.js";
 import { serializeSourceAddressedBranchEntries } from "./serialize.js";
 import {
 	TASTE_COVERAGE,
@@ -39,6 +43,7 @@ export interface ConsolidationDeps {
 export interface ConsolidationSummary {
 	chunks: number;
 	signalsRecorded: number;
+	entriesUpserted: number;
 	/** True when the branch was drained; false when the chunk cap was reached. */
 	reachedEnd: boolean;
 }
@@ -79,6 +84,7 @@ export async function runTasteConsolidation(
 	let cursor = latestCoverageIndex(entries);
 	let chunks = 0;
 	let signalsRecorded = 0;
+	let entriesUpserted = 0;
 	let reachedEnd = false;
 	let resolved: Awaited<ReturnType<typeof resolveTasteModel>> | undefined;
 	let resolvedOnce = false;
@@ -134,6 +140,34 @@ export async function runTasteConsolidation(
 			}));
 			appendLedger(path, records);
 			signalsRecorded += signals.length;
+
+			// Distill never throws for an unreachable classifier: it degrades to the
+			// heuristic. A hard failure here therefore means a code defect, which is
+			// worth recording and surfacing without losing the recorded signals.
+			try {
+				const candidates = await distillSignals({
+					signals,
+					project: basename(ctx.cwd),
+					config: runtime.config.classifier,
+					registry: ctx.modelRegistry as ClassifierRegistry | undefined,
+					sessionId,
+				});
+				const now = new Date().toISOString();
+				for (const candidate of candidates) {
+					const { projectRecords, globalRecords } = reconcileCandidate({
+						cwd: ctx.cwd,
+						candidate,
+						projectKey,
+						promoteAtProjectCount: runtime.config.promoteAtProjectCount,
+						now,
+					});
+					appendLedger(path, projectRecords);
+					if (globalRecords.length > 0) appendLedger(ledgerPath(globalTasteDir()), globalRecords);
+					entriesUpserted += 1;
+				}
+			} catch (error) {
+				runtime.recordStageError("distill", error);
+			}
 		}
 
 		const data: TasteCoverageData = { coversUpToId, signalCount: signals?.length ?? 0 };
@@ -148,5 +182,5 @@ export async function runTasteConsolidation(
 		chunks++;
 	}
 
-	return { chunks, signalsRecorded, reachedEnd };
+	return { chunks, signalsRecorded, entriesUpserted, reachedEnd };
 }

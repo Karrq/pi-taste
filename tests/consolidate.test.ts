@@ -92,7 +92,7 @@ describe("runTasteConsolidation", () => {
 			runExtraction: async (args) => [signal("Always use tabs", [args.allowedSourceEntryIds[0]])],
 		});
 
-		expect(summary).toEqual({ chunks: 1, signalsRecorded: 1, reachedEnd: true });
+		expect(summary).toEqual({ chunks: 1, signalsRecorded: 1, entriesUpserted: 1, reachedEnd: true });
 		expect(appended).toHaveLength(1);
 		expect(appended[0]?.customType).toBe(TASTE_COVERAGE);
 		expect((appended[0]?.data as { coversUpToId: string }).coversUpToId).toBe("m2");
@@ -122,7 +122,7 @@ describe("runTasteConsolidation", () => {
 			runExtraction: async () => undefined,
 		});
 
-		expect(summary).toEqual({ chunks: 1, signalsRecorded: 0, reachedEnd: true });
+		expect(summary).toEqual({ chunks: 1, signalsRecorded: 0, entriesUpserted: 0, reachedEnd: true });
 		expect(appended).toHaveLength(1);
 		expect((appended[0]?.data as { signalCount: number }).signalCount).toBe(0);
 	});
