@@ -1,15 +1,21 @@
 import type { ExtensionAPI, ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
 import { setTasteEnabled } from "../config.js";
 import { runTasteConsolidation } from "../consolidate.js";
-import { foldLedger } from "../ledger/fold.js";
+import { exportTasteMarkdown } from "../export.js";
+import { foldLedger, normalizeTasteContent, type TasteEntry } from "../ledger/index.js";
+import { appendLedger } from "../ledger/store.js";
 import { globalTasteDir, ledgerPath, projectTasteDir } from "../ledger/paths.js";
 import { readLedger } from "../ledger/store.js";
+import { runTastePrune } from "../prune.js";
+import { aggregateAcrossProjects, buildGlobalEntry } from "../reconcile.js";
+import { rememberPreference } from "../remember.js";
 import { mergeTasteEntries, renderTasteSection } from "../render/taste-section.js";
 import type { Runtime } from "../runtime.js";
 import { refreshTasteSnapshot } from "../taste-snapshot.js";
 
 const HELP = [
-	"taste: status | enable [--user] | disable [--user] | view | consolidate",
+	"taste: status | enable [--user] | disable [--user] | view | consolidate | prune",
+	"       remember <text> | forget <text|id> | promote <text|id> | export",
 ].join("\n");
 
 function parseArgs(args: string): { parts: string[]; user: boolean } {
@@ -18,12 +24,33 @@ function parseArgs(args: string): { parts: string[]; user: boolean } {
 	return { parts: all.filter((part) => part !== "--user"), user };
 }
 
-function projectEntries(cwd: string) {
+function projectEntries(cwd: string): TasteEntry[] {
 	return foldLedger(readLedger(ledgerPath(projectTasteDir(cwd)))).activeEntries;
 }
 
-function globalEntries() {
+function globalEntries(): TasteEntry[] {
 	return foldLedger(readLedger(ledgerPath(globalTasteDir()))).activeEntries;
+}
+
+/** Resolve an entry by full id, id prefix, or normalized content match. */
+function findEntry(entries: readonly TasteEntry[], selector: string): TasteEntry | undefined {
+	const needle = normalizeTasteContent(selector);
+	if (!needle) return undefined;
+	return (
+		entries.find((entry) => entry.id === selector)
+		?? entries.find((entry) => selector.length >= 6 && entry.id.startsWith(selector))
+		?? entries.find((entry) => normalizeTasteContent(entry.content) === needle)
+		?? entries.find((entry) => normalizeTasteContent(entry.content).includes(needle))
+	);
+}
+
+function commandSessionId(ctx: ExtensionCommandContext): string | undefined {
+	const manager = ctx.sessionManager as { getSessionId?: () => string | undefined } | undefined;
+	try {
+		return manager?.getSessionId?.();
+	} catch {
+		return undefined;
+	}
 }
 
 function statusText(runtime: Runtime, cwd: string): string {
@@ -38,6 +65,7 @@ function statusText(runtime: Runtime, cwd: string): string {
 		`project: ${project.length} entries — ${projectTasteDir(cwd)}`,
 		`global: ${global.length} entries — ${globalTasteDir()}`,
 		`injectable: ${eligible.length} (floor ${runtime.config.injectionConfidenceFloor})`,
+		`prune: inferred entries below ${runtime.config.pruneConfidenceFloor}`,
 		`classifier: ${classifier.mode} via ${classifier.provider}${classifier.model ? `/${classifier.model}` : ""}`,
 	].join("\n");
 }
@@ -54,11 +82,12 @@ function viewText(runtime: Runtime, cwd: string): string {
 
 export function registerTasteCommand(pi: ExtensionAPI, runtime: Runtime): void {
 	pi.registerCommand("taste", {
-		description: "Taste: status, enable/disable, view, consolidate",
+		description: "Taste: status, enable/disable, view, consolidate, prune, remember, forget, promote, export",
 		handler: async (args: string, ctx: ExtensionCommandContext) => {
 			runtime.ensureConfig(ctx.cwd);
 			const { parts, user } = parseArgs(args);
 			const sub = parts[0] ?? "status";
+			const selector = parts.slice(1).join(" ").trim();
 
 			switch (sub) {
 				case "enable":
@@ -73,6 +102,82 @@ export function registerTasteCommand(pi: ExtensionAPI, runtime: Runtime): void {
 				}
 				case "view": {
 					ctx.ui.notify(viewText(runtime, ctx.cwd), "info");
+					return;
+				}
+				case "remember": {
+					if (!selector) {
+						ctx.ui.notify("taste: remember <text>", "warning");
+						return;
+					}
+					const sessionId = commandSessionId(ctx);
+					rememberPreference({
+						cwd: ctx.cwd,
+						text: selector,
+						promoteAtProjectCount: runtime.config.promoteAtProjectCount,
+						...(sessionId ? { sessionId } : {}),
+					});
+					ctx.ui.notify(`taste: recorded "${selector}" (100%, explicit)`, "info");
+					return;
+				}
+				case "forget": {
+					const entry = findEntry(projectEntries(ctx.cwd), selector) ?? findEntry(globalEntries(), selector);
+					if (!entry) {
+						ctx.ui.notify(`taste: no entry matching "${selector}"`, "warning");
+						return;
+					}
+					const path = ledgerPath(entry.scope === "global" ? globalTasteDir() : projectTasteDir(ctx.cwd));
+					appendLedger(path, [
+						{ type: "entry.retracted", at: new Date().toISOString(), entryId: entry.id, reason: "forgotten by user" },
+					]);
+					ctx.ui.notify(`taste: forgot "${entry.content}"`, "info");
+					return;
+				}
+				case "promote": {
+					const entry = findEntry(projectEntries(ctx.cwd), selector) ?? findEntry(globalEntries(), selector);
+					if (!entry) {
+						ctx.ui.notify(`taste: no entry matching "${selector}"`, "warning");
+						return;
+					}
+					const aggregate = aggregateAcrossProjects(entry.id);
+					const projectKeys = [...aggregate.projectKeys, ...entry.projectKeys];
+					const globalPath = ledgerPath(globalTasteDir());
+					const existing = foldLedger(readLedger(globalPath)).entriesById.get(entry.id);
+					const at = new Date().toISOString();
+					appendLedger(globalPath, [
+						{
+							type: "entry.upserted",
+							at,
+							entry: buildGlobalEntry({
+								entry,
+								projectKeys,
+								confidence: Math.max(entry.confidence, aggregate.confidence),
+								now: at,
+								...(existing ? { existing } : {}),
+							}),
+						},
+					]);
+					ctx.ui.notify(`taste: promoted "${entry.content}" to global`, "info");
+					return;
+				}
+				case "export": {
+					const result = exportTasteMarkdown(ctx.cwd);
+					ctx.ui.notify(
+						`taste: wrote ${result.projectPath} (${result.projectCount}) and ${result.globalPath} (${result.globalCount})`,
+						"info",
+					);
+					return;
+				}
+				case "prune": {
+					try {
+						const result = await runTastePrune(runtime, { cwd: ctx.cwd, modelRegistry: ctx.modelRegistry });
+						const classifierNote = result.classifierError ? ` (classifier unavailable: ${result.classifierError})` : "";
+						ctx.ui.notify(
+							`taste: retracted ${result.retractions.length} of ${result.total} entries${classifierNote}`,
+							"info",
+						);
+					} catch (error) {
+						ctx.ui.notify(`taste: prune failed: ${runtime.recordStageError("prune", error)}`, "warning");
+					}
 					return;
 				}
 				case "consolidate": {
@@ -97,7 +202,8 @@ export function registerTasteCommand(pi: ExtensionAPI, runtime: Runtime): void {
 						const remainder = summary.reachedEnd ? "" : " (more remain; run again)";
 						ctx.ui.notify(
 							`taste: ${summary.signalsRecorded} signal${summary.signalsRecorded === 1 ? "" : "s"}, `
-							+ `${summary.entriesUpserted} entr${summary.entriesUpserted === 1 ? "y" : "ies"} from ${summary.chunks} chunk${summary.chunks === 1 ? "" : "s"}${remainder}`,
+							+ `${summary.entriesUpserted} entr${summary.entriesUpserted === 1 ? "y" : "ies"}, `
+							+ `${summary.entriesRetracted} retracted from ${summary.chunks} chunk${summary.chunks === 1 ? "" : "s"}${remainder}`,
 							"info",
 						);
 					} catch (error) {

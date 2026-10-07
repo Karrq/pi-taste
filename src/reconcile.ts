@@ -55,6 +55,24 @@ export interface ReconcileResult {
 	entry: TasteEntry;
 }
 
+/** Build the global-layer entry for a preference, preserving the original creation time. */
+export function buildGlobalEntry(args: {
+	entry: TasteEntry;
+	projectKeys: readonly string[];
+	confidence: number;
+	now: string;
+	existing?: TasteEntry;
+}): TasteEntry {
+	return {
+		...args.entry,
+		scope: "global",
+		confidence: clamp01(args.confidence),
+		projectKeys: uniqueStrings(args.projectKeys),
+		createdAt: args.existing?.createdAt ?? args.entry.createdAt,
+		updatedAt: args.now,
+	};
+}
+
 /**
  * Merge one distilled candidate into the project ledger, then promote it to the
  * global ledger when the classifier judged it general or when it has now been
@@ -96,14 +114,17 @@ export function reconcileCandidate(args: {
 	if (shouldPromote) {
 		const globalPath = ledgerPath(globalTasteDir());
 		const globalExisting = foldLedger(readLedger(globalPath)).entriesById.get(id);
-		const globalEntry: TasteEntry = {
-			...entry,
-			scope: "global",
-			confidence: Math.max(confidence, aggregate.confidence),
-			projectKeys: mergedKeys,
-			createdAt: globalExisting?.createdAt ?? entry.createdAt,
-		};
-		globalRecords.push({ type: "entry.upserted", at: args.now, entry: globalEntry });
+		globalRecords.push({
+			type: "entry.upserted",
+			at: args.now,
+			entry: buildGlobalEntry({
+				entry,
+				projectKeys: mergedKeys,
+				confidence: Math.max(confidence, aggregate.confidence),
+				now: args.now,
+				...(globalExisting ? { existing: globalExisting } : {}),
+			}),
+		});
 	}
 
 	return { projectRecords, globalRecords, entry };
