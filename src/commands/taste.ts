@@ -8,6 +8,7 @@ import { globalTasteDir, ledgerPath, projectTasteDir } from "../ledger/paths.js"
 import { readLedger } from "../ledger/store.js";
 import { runTastePrune } from "../prune.js";
 import { aggregateAcrossProjects, buildGlobalEntry } from "../reconcile.js";
+import { runTasteReflect } from "../reflect.js";
 import { rememberPreference } from "../remember.js";
 import { mergeTasteEntries, renderTasteSection } from "../render/taste-section.js";
 import type { Runtime } from "../runtime.js";
@@ -168,11 +169,28 @@ export function registerTasteCommand(pi: ExtensionAPI, runtime: Runtime): void {
 					return;
 				}
 				case "prune": {
+					let merged = 0;
+					let absorbed = 0;
+					let reflectNote = "";
+					try {
+						const reflected = await runTasteReflect(runtime, {
+							cwd: ctx.cwd,
+							model: ctx.model,
+							modelRegistry: ctx.modelRegistry,
+							thinkingLevel: ctx.thinkingLevel,
+						});
+						merged = reflected.merged;
+						absorbed = reflected.entriesRetracted;
+						if (reflected.truncated) reflectNote = ` (reflected newest ${reflected.entriesConsidered})`;
+					} catch (error) {
+						reflectNote = ` (reflect unavailable: ${runtime.recordStageError("reflect", error)})`;
+					}
 					try {
 						const result = await runTastePrune(runtime, { cwd: ctx.cwd, modelRegistry: ctx.modelRegistry });
 						const classifierNote = result.classifierError ? ` (classifier unavailable: ${result.classifierError})` : "";
 						ctx.ui.notify(
-							`taste: retracted ${result.retractions.length} of ${result.total} entries${classifierNote}`,
+							`taste: merged ${merged} (${absorbed} absorbed), `
+							+ `retracted ${result.retractions.length} of ${result.total} entries${reflectNote}${classifierNote}`,
 							"info",
 						);
 					} catch (error) {
