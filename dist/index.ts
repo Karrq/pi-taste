@@ -227,7 +227,7 @@ function loadConfig(cwd, env = process.env) {
   return merged;
 }
 function setTasteEnabled(args) {
-  const path = settingsPathFor(args.cwd, args.user === true);
+  const path = settingsPathFor(args.cwd, args.scope !== "project");
   let raw = {};
   if (existsSync(path)) {
     try {
@@ -316,7 +316,6 @@ import { getAgentDir as getAgentDir2 } from "@earendil-works/pi-coding-agent";
 var TASTE_DIR_NAME = "taste";
 var GLOBAL_TASTE_KEY = "global";
 var LEDGER_FILE_NAME = "ledger.ndjson";
-var TASTE_FILE_NAME = "taste.md";
 function encodeCwd(cwd) {
   const resolved = resolve(cwd);
   return `--${resolved.replace(/^[/\\]/u, "").replace(/[/\\:]/gu, "-")}--`;
@@ -332,9 +331,6 @@ function globalTasteDir() {
 }
 function ledgerPath(dir) {
   return join2(dir, LEDGER_FILE_NAME);
-}
-function tasteFilePath(dir) {
-  return join2(dir, TASTE_FILE_NAME);
 }
 
 // src/ledger/store.ts
@@ -1497,7 +1493,7 @@ async function runTasteConsolidation(pi, runtime, ctx, deps = {}) {
 
 // src/export.ts
 import { mkdirSync as mkdirSync4, writeFileSync as writeFileSync2 } from "node:fs";
-import { dirname as dirname3 } from "node:path";
+import { dirname as dirname3, join as join5 } from "node:path";
 
 // src/render/taste-markdown.ts
 function renderTasteMarkdown(entries, options) {
@@ -1569,23 +1565,15 @@ function writeMarkdown(path, content) {
 function exportTasteMarkdown(cwd) {
   const projectEntries2 = foldLedger(readLedger(ledgerPath(projectTasteDir(cwd)))).activeEntries;
   const globalEntries2 = foldLedger(readLedger(ledgerPath(globalTasteDir()))).activeEntries;
-  const generatedAt = (/* @__PURE__ */ new Date()).toISOString();
-  const projectPath = tasteFilePath(projectTasteDir(cwd));
-  const globalPath = tasteFilePath(globalTasteDir());
+  const path = join5(cwd, "taste.md");
   writeMarkdown(
-    projectPath,
+    path,
     renderTasteMarkdown(mergeTasteEntries(projectEntries2, globalEntries2), {
-      title: `Taste: ${encodeCwd(cwd)}`,
-      generatedAt
+      title: "Taste",
+      generatedAt: (/* @__PURE__ */ new Date()).toISOString()
     })
   );
-  writeMarkdown(globalPath, renderTasteMarkdown(globalEntries2, { title: "Global taste", generatedAt }));
-  return {
-    projectPath,
-    globalPath,
-    projectCount: projectEntries2.length,
-    globalCount: globalEntries2.length
-  };
+  return { path, projectCount: projectEntries2.length, globalCount: globalEntries2.length };
 }
 
 // src/agents/reflect/agent.ts
@@ -1856,6 +1844,19 @@ function rememberPreference(args) {
   return { signal, entry, globalRecords };
 }
 
+// src/select.ts
+function findEntry(entries, selector) {
+  const trimmed = selector.trim();
+  if (trimmed.startsWith("id:")) {
+    const id = trimmed.slice(3).trim();
+    if (!id) return void 0;
+    return entries.find((entry) => entry.id === id) ?? entries.find((entry) => entry.id.startsWith(id));
+  }
+  const needle = normalizeTasteContent(trimmed);
+  if (!needle) return void 0;
+  return entries.find((entry) => normalizeTasteContent(entry.content) === needle) ?? entries.find((entry) => normalizeTasteContent(entry.content).includes(needle));
+}
+
 // src/taste-snapshot.ts
 function refreshTasteSnapshot(runtime, cwd) {
   runtime.ensureConfig(cwd);
@@ -1874,24 +1875,19 @@ function refreshTasteSnapshot(runtime, cwd) {
 
 // src/commands/taste.ts
 var HELP = [
-  "taste: status | enable [--user] | disable [--user] | view | consolidate | prune",
-  "       remember <text> | forget <text|id> | promote <text|id> | export"
+  "taste: status | enable [--project] | disable [--project] | view | consolidate | prune",
+  "       remember <text> | forget <text | id:...> | promote <text | id:...> | export"
 ].join("\n");
 function parseArgs(args) {
   const all = args.trim().split(/\s+/u).filter(Boolean);
-  const user = all.includes("--user");
-  return { parts: all.filter((part) => part !== "--user"), user };
+  const project = all.includes("--project");
+  return { parts: all.filter((part) => part !== "--project"), project };
 }
 function projectEntries(cwd) {
   return foldLedger(readLedger(ledgerPath(projectTasteDir(cwd)))).activeEntries;
 }
 function globalEntries() {
   return foldLedger(readLedger(ledgerPath(globalTasteDir()))).activeEntries;
-}
-function findEntry(entries, selector) {
-  const needle = normalizeTasteContent(selector);
-  if (!needle) return void 0;
-  return entries.find((entry) => entry.id === selector) ?? entries.find((entry) => selector.length >= 6 && entry.id.startsWith(selector)) ?? entries.find((entry) => normalizeTasteContent(entry.content) === needle) ?? entries.find((entry) => normalizeTasteContent(entry.content).includes(needle));
 }
 function commandSessionId(ctx) {
   const manager = ctx.sessionManager;
@@ -1929,18 +1925,18 @@ function registerTasteCommand(pi, runtime) {
     description: "Taste: status, enable/disable, view, consolidate, prune, remember, forget, promote, export",
     handler: async (args, ctx) => {
       runtime.ensureConfig(ctx.cwd);
-      const { parts, user } = parseArgs(args);
+      const { parts, project } = parseArgs(args);
       const sub = parts[0] ?? "status";
       const selector = parts.slice(1).join(" ").trim();
       switch (sub) {
         case "enable":
         case "disable": {
           const enabled = sub === "enable";
-          const path = setTasteEnabled({ cwd: ctx.cwd, enabled, user });
+          const path = setTasteEnabled({ cwd: ctx.cwd, enabled, scope: project ? "project" : "user" });
           runtime.reloadConfig();
           runtime.ensureConfig(ctx.cwd);
           refreshTasteSnapshot(runtime, ctx.cwd);
-          ctx.ui.notify(`taste: ${enabled ? "enabled" : "disabled"} (${path})`, "info");
+          ctx.ui.notify(`taste: ${enabled ? "enabled" : "disabled"} (${project ? "project" : "user"}: ${path})`, "info");
           return;
         }
         case "view": {
@@ -2005,7 +2001,7 @@ function registerTasteCommand(pi, runtime) {
         case "export": {
           const result = exportTasteMarkdown(ctx.cwd);
           ctx.ui.notify(
-            `taste: wrote ${result.projectPath} (${result.projectCount}) and ${result.globalPath} (${result.globalCount})`,
+            `taste: wrote ${result.path} (${result.projectCount} project, ${result.globalCount} global)`,
             "info"
           );
           return;
