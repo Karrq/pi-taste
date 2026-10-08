@@ -78,15 +78,15 @@ All behavior lives behind `/taste`.
 | Command | Description |
 | --- | --- |
 | `/taste status` | Enabled state, project and global entry counts, injectable count, prune floor, classifier mode. |
-| `/taste enable [--user]` | Turn taste on and refresh the snapshot. Writes the project settings file, or the user file with `--user`. |
-| `/taste disable [--user]` | Turn taste off. Nothing is injected while disabled. |
+| `/taste enable [--project]` | Turn taste on and refresh the snapshot. Writes the user settings file by default, or the project file with `--project`. |
+| `/taste disable [--project]` | Turn taste off. Nothing is injected while disabled. |
 | `/taste view` | List merged project and global entries, highest confidence first. |
 | `/taste consolidate` | Run extract, distill, reconcile, and prune over this session's branch. Repeated runs continue where coverage left off. |
 | `/taste prune` | Run reflect and then prune over the project pool. This is the dedup pass: it merges related entries and retracts contradictions. |
 | `/taste remember <text>` | Record a preference explicitly, at full confidence with no model call. Merges into an existing entry and still promotes by recurrence. |
-| `/taste forget <text\|id>` | Retract one entry. Accepts full id, id prefix, or text. |
-| `/taste promote <text\|id>` | Force an entry into the global layer. |
-| `/taste export` | Write the human-readable `taste.md` next to the project and global ledgers. |
+| `/taste forget <text\|id:...>` | Retract one entry. Matches text, or an id (full or prefix) when prefixed with `id:`. |
+| `/taste promote <text\|id:...>` | Force an entry into the global layer. Same selector rules as forget. |
+| `/taste export` | Write `./taste.md` in the current directory with the merged project and global view. |
 
 `/taste consolidate` and `/taste remember` still write the ledger while taste is
 disabled, since both are explicit user actions. Nothing is injected until it is
@@ -97,9 +97,7 @@ enabled.
 Everything lives under `~/.pi/agent/taste/`:
 
 - `<encoded-cwd>/ledger.ndjson` — the project ledger, append-only.
-- `<encoded-cwd>/taste.md` — human-readable export of the project view.
 - `global/ledger.ndjson` — the global ledger.
-- `global/taste.md` — human-readable export of the global layer.
 - `distill-scores/<session>.ndjson` — classifier calibration rows: entry ids,
   decisions, and numbers only, never conversation text.
 
@@ -107,8 +105,9 @@ The project key is your working directory encoded the same way pi encodes
 session directories, so a project's taste sits beside its sessions and stays
 stable across runs. Move the checkout and it is a new project.
 
-The ledger is the source of truth. `taste.md` is a view and is overwritten on
-export. Four record types make up a ledger: `signal.recorded`,
+The ledger is the source of truth. No markdown is stored: `/taste export`
+renders `./taste.md` in the current directory on demand and overwrites it on the
+next export. Four record types make up a ledger: `signal.recorded`,
 `entry.upserted`, `entry.retracted`, and `entry.merged`. Malformed lines are
 skipped on read, so one bad write never takes the whole file down.
 
