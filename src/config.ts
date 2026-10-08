@@ -10,7 +10,7 @@ export interface ConfiguredModel {
 }
 
 /** The pipeline stages, each independently routable to a model. */
-export const TASTE_STAGES = ["extract", "distill", "reconcile", "prune"] as const;
+export const TASTE_STAGES = ["extract", "distill", "reflect", "reconcile", "prune"] as const;
 export type TasteStage = (typeof TASTE_STAGES)[number];
 
 /**
@@ -78,6 +78,8 @@ export interface Config {
 	extractChunkMaxTokens?: number;
 	/** Maximum extraction chunks one `/taste consolidate` run may process. */
 	consolidateMaxChunks: number;
+	/** Most recently updated entries one reflection call may consider. */
+	reflectMaxEntries: number;
 	agentMaxTurns: number;
 	agentMaxTokens: number;
 	model?: ConfiguredModel;
@@ -97,6 +99,7 @@ export const DEFAULTS: Config = {
 	pruneConfidenceFloor: 0.3,
 	extractChunkMaxTokens: undefined,
 	consolidateMaxChunks: 8,
+	reflectMaxEntries: 60,
 	agentMaxTurns: 12,
 	agentMaxTokens: 16_000,
 	modelMap: [],
@@ -282,6 +285,8 @@ function normalizeSettingsConfig(value: Record<string, unknown>): NormalizedSett
 	if (extractChunk !== undefined) normalized.extractChunkMaxTokens = extractChunk;
 	const maxChunks = positiveInteger(value.consolidateMaxChunks);
 	if (maxChunks !== undefined) normalized.consolidateMaxChunks = maxChunks;
+	const reflectMax = positiveInteger(value.reflectMaxEntries);
+	if (reflectMax !== undefined) normalized.reflectMaxEntries = reflectMax;
 	const agentMaxTurns = positiveInteger(value.agentMaxTurns);
 	if (agentMaxTurns !== undefined) normalized.agentMaxTurns = agentMaxTurns;
 	const agentMaxTokens = positiveInteger(value.agentMaxTokens);

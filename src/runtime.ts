@@ -4,6 +4,7 @@ import { type Config, DEFAULTS, loadConfig } from "./config.js";
 export interface StageErrors {
 	extract?: string;
 	distill?: string;
+	reflect?: string;
 	reconcile?: string;
 	prune?: string;
 }
