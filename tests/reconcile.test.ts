@@ -135,6 +135,30 @@ describe("reconcileCandidate", () => {
 		expect(result.globalRecords).toHaveLength(1);
 	});
 
+	it("redirects a re-observed phrasing onto the consolidated entry", () => {
+		const cwd = "/tmp/pi-taste-proj-merge";
+		const projectKey = encodeCwd(cwd);
+		const source = entry("Use tabs always", { confidence: 0.6, projectKeys: [projectKey], signalIds: ["s0"] });
+		const merged = entry("Always use tabs", { confidence: 0.7, projectKeys: [projectKey], signalIds: ["s0"] });
+		appendLedger(ledgerPath(projectTasteDir(cwd)), [
+			{ type: "entry.upserted", at: source.updatedAt, entry: source },
+			{ type: "entry.merged", at: "2026-01-02T00:00:00.000Z", entry: merged, fromIds: [source.id] },
+		]);
+
+		const result = reconcileCandidate({
+			cwd,
+			candidate: candidate("Use tabs always"),
+			projectKey,
+			promoteAtProjectCount: 5,
+			now: "2026-01-03T00:00:00.000Z",
+		});
+
+		expect(result.entry.id).toBe(merged.id);
+		expect(result.entry.content).toBe("Always use tabs");
+		expect(result.entry.signalIds).toEqual(["s0", "s1"]);
+		expect(result.entry.confidence).toBeCloseTo(0.88, 5);
+	});
+
 	it("persists the merged entry so a rerun sees it", () => {
 		const cwd = "/tmp/pi-taste-proj-d";
 		const projectKey = encodeCwd(cwd);

@@ -25,4 +25,4 @@ export {
 	tasteRootDir,
 } from "./paths.js";
 export { appendLedger, readLedger } from "./store.js";
-export { foldLedger, type FoldedLedger } from "./fold.js";
+export { foldLedger, resolveAliasId, type FoldedLedger } from "./fold.js";

@@ -1,7 +1,7 @@
 import { existsSync, readdirSync } from "node:fs";
 import { join } from "node:path";
 import type { DistilledCandidate } from "./agents/distill/index.js";
-import { foldLedger } from "./ledger/fold.js";
+import { foldLedger, resolveAliasId } from "./ledger/fold.js";
 import { GLOBAL_TASTE_KEY, globalTasteDir, ledgerPath, projectTasteDir, tasteRootDir } from "./ledger/paths.js";
 import { readLedger } from "./ledger/store.js";
 import { tasteEntryId, type LedgerRecord, type TasteEntry } from "./ledger/types.js";
@@ -85,9 +85,15 @@ export function reconcileCandidate(args: {
 	promoteAtProjectCount: number;
 	now: string;
 }): ReconcileResult {
-	const id = tasteEntryId(args.candidate.content);
 	const projectPath = ledgerPath(projectTasteDir(args.cwd));
-	const existing = foldLedger(readLedger(projectPath)).entriesById.get(id);
+	const folded = foldLedger(readLedger(projectPath));
+	const rawId = tasteEntryId(args.candidate.content);
+	// A merge rewrites content, so the id a re-observed phrasing hashes to may now
+	// be an alias. Redirect the observation onto the consolidated entry instead of
+	// recreating a source the reflection already absorbed.
+	const id = resolveAliasId(folded, rawId);
+	const redirected = id !== rawId;
+	const existing = folded.entriesById.get(id);
 
 	const signalIds = uniqueStrings([...(existing?.signalIds ?? []), args.candidate.signal.id]);
 	const projectKeys = uniqueStrings([...(existing?.projectKeys ?? []), args.projectKey]);
@@ -95,8 +101,9 @@ export function reconcileCandidate(args: {
 
 	const entry: TasteEntry = {
 		id,
-		content: args.candidate.content,
-		category: args.candidate.category,
+		// A redirect keeps the consolidated wording; the observation only reaffirms it.
+		content: redirected && existing ? existing.content : args.candidate.content,
+		category: redirected && existing ? existing.category : args.candidate.category,
 		confidence,
 		explicit: (existing?.explicit ?? false) || args.candidate.explicit,
 		scope: "project",

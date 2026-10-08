@@ -2,6 +2,7 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
+import { isLedgerRecord } from "../src/ledger/index.js";
 import { appendLedger, foldLedger, readLedger, tasteEntryId } from "../src/ledger/index.js";
 import type { LedgerRecord, TasteEntry } from "../src/ledger/index.js";
 
@@ -80,5 +81,18 @@ describe("foldLedger", () => {
 describe("tasteEntryId", () => {
 	it("is stable across case, whitespace and trailing punctuation", () => {
 		expect(tasteEntryId("Use   TABS.")).toBe(tasteEntryId("use tabs"));
+	});
+});
+
+describe("entry.merged validation", () => {
+	it("accepts a merge that cites other entries", () => {
+		const source = entry("Use tabs");
+		const merged = entry("Always use tabs");
+		expect(isLedgerRecord({ type: "entry.merged", at: "2026-01-02T00:00:00.000Z", entry: merged, fromIds: [source.id] })).toBe(true);
+	});
+
+	it("rejects a merge that lists its own entry id as a source", () => {
+		const merged = entry("Always use tabs");
+		expect(isLedgerRecord({ type: "entry.merged", at: "2026-01-02T00:00:00.000Z", entry: merged, fromIds: [merged.id] })).toBe(false);
 	});
 });

@@ -50,7 +50,9 @@ export interface TasteEntry {
 export type LedgerRecord =
 	| { type: "signal.recorded"; at: string; signal: Signal }
 	| { type: "entry.upserted"; at: string; entry: TasteEntry }
-	| { type: "entry.retracted"; at: string; entryId: string; reason: string };
+	| { type: "entry.retracted"; at: string; entryId: string; reason: string }
+	/** A consolidation: `entry` replaces `fromIds`, which are tombstoned and aliased to it. */
+	| { type: "entry.merged"; at: string; entry: TasteEntry; fromIds: string[] };
 
 /** Stable identity for a taste statement: case, whitespace and trailing punctuation insensitive. */
 export function normalizeTasteContent(content: string): string {
@@ -126,6 +128,13 @@ export function isLedgerRecord(value: unknown): value is LedgerRecord {
 			return isTasteEntry(value.entry);
 		case "entry.retracted":
 			return isNonEmptyString(value.entryId) && isNonEmptyString(value.reason);
+		case "entry.merged":
+			return (
+				isTasteEntry(value.entry)
+				&& isNonEmptyStringArray(value.fromIds)
+				&& value.fromIds.length > 0
+				&& !value.fromIds.includes(value.entry.id)
+			);
 		default:
 			return false;
 	}
