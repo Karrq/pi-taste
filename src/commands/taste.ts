@@ -2,7 +2,7 @@ import type { ExtensionAPI, ExtensionCommandContext } from "@earendil-works/pi-c
 import { setTasteEnabled } from "../config.js";
 import { runTasteConsolidation } from "../consolidate.js";
 import { exportTasteMarkdown } from "../export.js";
-import { foldLedger, normalizeTasteContent, type TasteEntry } from "../ledger/index.js";
+import { foldLedger, type TasteEntry } from "../ledger/index.js";
 import { appendLedger } from "../ledger/store.js";
 import { globalTasteDir, ledgerPath, projectTasteDir } from "../ledger/paths.js";
 import { readLedger } from "../ledger/store.js";
@@ -10,13 +10,14 @@ import { runTastePrune } from "../prune.js";
 import { aggregateAcrossProjects, buildGlobalEntry } from "../reconcile.js";
 import { runTasteReflect } from "../reflect.js";
 import { rememberPreference } from "../remember.js";
+import { findEntry } from "../select.js";
 import { mergeTasteEntries, renderTasteSection } from "../render/taste-section.js";
 import type { Runtime } from "../runtime.js";
 import { refreshTasteSnapshot } from "../taste-snapshot.js";
 
 const HELP = [
 	"taste: status | enable [--project] | disable [--project] | view | consolidate | prune",
-	"       remember <text> | forget <text|id> | promote <text|id> | export",
+	"       remember <text> | forget <text | id:...> | promote <text | id:...> | export",
 ].join("\n");
 
 function parseArgs(args: string): { parts: string[]; project: boolean } {
@@ -31,18 +32,6 @@ function projectEntries(cwd: string): TasteEntry[] {
 
 function globalEntries(): TasteEntry[] {
 	return foldLedger(readLedger(ledgerPath(globalTasteDir()))).activeEntries;
-}
-
-/** Resolve an entry by full id, id prefix, or normalized content match. */
-function findEntry(entries: readonly TasteEntry[], selector: string): TasteEntry | undefined {
-	const needle = normalizeTasteContent(selector);
-	if (!needle) return undefined;
-	return (
-		entries.find((entry) => entry.id === selector)
-		?? entries.find((entry) => selector.length >= 6 && entry.id.startsWith(selector))
-		?? entries.find((entry) => normalizeTasteContent(entry.content) === needle)
-		?? entries.find((entry) => normalizeTasteContent(entry.content).includes(needle))
-	);
 }
 
 function commandSessionId(ctx: ExtensionCommandContext): string | undefined {
