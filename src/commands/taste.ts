@@ -15,14 +15,14 @@ import type { Runtime } from "../runtime.js";
 import { refreshTasteSnapshot } from "../taste-snapshot.js";
 
 const HELP = [
-	"taste: status | enable [--user] | disable [--user] | view | consolidate | prune",
+	"taste: status | enable [--project] | disable [--project] | view | consolidate | prune",
 	"       remember <text> | forget <text|id> | promote <text|id> | export",
 ].join("\n");
 
-function parseArgs(args: string): { parts: string[]; user: boolean } {
+function parseArgs(args: string): { parts: string[]; project: boolean } {
 	const all = args.trim().split(/\s+/u).filter(Boolean);
-	const user = all.includes("--user");
-	return { parts: all.filter((part) => part !== "--user"), user };
+	const project = all.includes("--project");
+	return { parts: all.filter((part) => part !== "--project"), project };
 }
 
 function projectEntries(cwd: string): TasteEntry[] {
@@ -86,7 +86,7 @@ export function registerTasteCommand(pi: ExtensionAPI, runtime: Runtime): void {
 		description: "Taste: status, enable/disable, view, consolidate, prune, remember, forget, promote, export",
 		handler: async (args: string, ctx: ExtensionCommandContext) => {
 			runtime.ensureConfig(ctx.cwd);
-			const { parts, user } = parseArgs(args);
+			const { parts, project } = parseArgs(args);
 			const sub = parts[0] ?? "status";
 			const selector = parts.slice(1).join(" ").trim();
 
@@ -94,11 +94,11 @@ export function registerTasteCommand(pi: ExtensionAPI, runtime: Runtime): void {
 				case "enable":
 				case "disable": {
 					const enabled = sub === "enable";
-					const path = setTasteEnabled({ cwd: ctx.cwd, enabled, user });
+					const path = setTasteEnabled({ cwd: ctx.cwd, enabled, scope: project ? "project" : "user" });
 					runtime.reloadConfig();
 					runtime.ensureConfig(ctx.cwd);
 					refreshTasteSnapshot(runtime, ctx.cwd);
-					ctx.ui.notify(`taste: ${enabled ? "enabled" : "disabled"} (${path})`, "info");
+					ctx.ui.notify(`taste: ${enabled ? "enabled" : "disabled"} (${project ? "project" : "user"}: ${path})`, "info");
 					return;
 				}
 				case "view": {

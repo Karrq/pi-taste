@@ -347,12 +347,12 @@ export function loadConfig(cwd: string, env: NodeJS.ProcessEnv = process.env): C
 }
 
 /**
- * Turn taste learning on or off by writing the namespaced setting. Project scope
- * by default; `user` targets `~/.pi/agent/settings.json`. Returns the file path
- * written, for the command to report.
+ * Turn taste learning on or off by writing the namespaced setting. User scope by
+ * default; `project` targets `./.pi/settings.json`. Returns the file path written,
+ * for the command to report.
  */
-export function setTasteEnabled(args: { cwd: string; enabled: boolean; user?: boolean }): string {
-	const path = settingsPathFor(args.cwd, args.user === true);
+export function setTasteEnabled(args: { cwd: string; enabled: boolean; scope?: "user" | "project" }): string {
+	const path = settingsPathFor(args.cwd, args.scope !== "project");
 	let raw: Record<string, unknown> = {};
 	if (existsSync(path)) {
 		try {
