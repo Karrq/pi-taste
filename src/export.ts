@@ -1,14 +1,13 @@
 import { mkdirSync, writeFileSync } from "node:fs";
-import { dirname } from "node:path";
+import { dirname, join } from "node:path";
 import { foldLedger, type TasteEntry } from "./ledger/index.js";
-import { encodeCwd, globalTasteDir, ledgerPath, projectTasteDir, tasteFilePath } from "./ledger/paths.js";
+import { globalTasteDir, ledgerPath, projectTasteDir } from "./ledger/paths.js";
 import { readLedger } from "./ledger/store.js";
 import { renderTasteMarkdown } from "./render/taste-markdown.js";
 import { mergeTasteEntries } from "./render/taste-section.js";
 
 export interface ExportResult {
-	projectPath: string;
-	globalPath: string;
+	path: string;
 	projectCount: number;
 	globalCount: number;
 }
@@ -19,30 +18,20 @@ function writeMarkdown(path: string, content: string): void {
 }
 
 /**
- * Write the human-readable profile next to each ledger. The project file holds
- * the merged view the agent actually sees; the global file holds only the
- * global layer.
+ * Write the human-readable profile to `<cwd>/taste.md`. This is the only place a
+ * markdown file is produced: the ledgers stay the source of truth, and the file
+ * is regenerated on each export rather than stored.
  */
 export function exportTasteMarkdown(cwd: string): ExportResult {
 	const projectEntries: TasteEntry[] = foldLedger(readLedger(ledgerPath(projectTasteDir(cwd)))).activeEntries;
 	const globalEntries: TasteEntry[] = foldLedger(readLedger(ledgerPath(globalTasteDir()))).activeEntries;
-	const generatedAt = new Date().toISOString();
-
-	const projectPath = tasteFilePath(projectTasteDir(cwd));
-	const globalPath = tasteFilePath(globalTasteDir());
+	const path = join(cwd, "taste.md");
 	writeMarkdown(
-		projectPath,
+		path,
 		renderTasteMarkdown(mergeTasteEntries(projectEntries, globalEntries), {
-			title: `Taste: ${encodeCwd(cwd)}`,
-			generatedAt,
+			title: "Taste",
+			generatedAt: new Date().toISOString(),
 		}),
 	);
-	writeMarkdown(globalPath, renderTasteMarkdown(globalEntries, { title: "Global taste", generatedAt }));
-
-	return {
-		projectPath,
-		globalPath,
-		projectCount: projectEntries.length,
-		globalCount: globalEntries.length,
-	};
+	return { path, projectCount: projectEntries.length, globalCount: globalEntries.length };
 }

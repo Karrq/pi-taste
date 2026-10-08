@@ -16,12 +16,10 @@ export {
 	GLOBAL_TASTE_KEY,
 	LEDGER_FILE_NAME,
 	TASTE_DIR_NAME,
-	TASTE_FILE_NAME,
 	encodeCwd,
 	globalTasteDir,
 	ledgerPath,
 	projectTasteDir,
-	tasteFilePath,
 	tasteRootDir,
 } from "./paths.js";
 export { appendLedger, readLedger } from "./store.js";

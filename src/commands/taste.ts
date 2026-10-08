@@ -152,7 +152,7 @@ export function registerTasteCommand(pi: ExtensionAPI, runtime: Runtime): void {
 				case "export": {
 					const result = exportTasteMarkdown(ctx.cwd);
 					ctx.ui.notify(
-						`taste: wrote ${result.projectPath} (${result.projectCount}) and ${result.globalPath} (${result.globalCount})`,
+						`taste: wrote ${result.path} (${result.projectCount} project, ${result.globalCount} global)`,
 						"info",
 					);
 					return;
