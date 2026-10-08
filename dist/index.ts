@@ -4,7 +4,7 @@
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { getAgentDir } from "@earendil-works/pi-coding-agent";
-var TASTE_STAGES = ["extract", "distill", "reconcile", "prune"];
+var TASTE_STAGES = ["extract", "distill", "reflect", "reconcile", "prune"];
 var SYSTEM_ONE_MODES = ["off", "shadow", "primary"];
 var CLASSIFIER_DEFAULTS = {
   mode: "shadow",
@@ -22,6 +22,7 @@ var DEFAULTS = {
   pruneConfidenceFloor: 0.3,
   extractChunkMaxTokens: void 0,
   consolidateMaxChunks: 8,
+  reflectMaxEntries: 60,
   agentMaxTurns: 12,
   agentMaxTokens: 16e3,
   modelMap: [],
@@ -169,6 +170,8 @@ function normalizeSettingsConfig(value) {
   if (extractChunk !== void 0) normalized.extractChunkMaxTokens = extractChunk;
   const maxChunks = positiveInteger(value.consolidateMaxChunks);
   if (maxChunks !== void 0) normalized.consolidateMaxChunks = maxChunks;
+  const reflectMax = positiveInteger(value.reflectMaxEntries);
+  if (reflectMax !== void 0) normalized.reflectMaxEntries = reflectMax;
   const agentMaxTurns = positiveInteger(value.agentMaxTurns);
   if (agentMaxTurns !== void 0) normalized.agentMaxTurns = agentMaxTurns;
   const agentMaxTokens = positiveInteger(value.agentMaxTokens);
@@ -300,6 +303,8 @@ function isLedgerRecord(value) {
       return isTasteEntry(value.entry);
     case "entry.retracted":
       return isNonEmptyString(value.entryId) && isNonEmptyString(value.reason);
+    case "entry.merged":
+      return isTasteEntry(value.entry) && isNonEmptyStringArray(value.fromIds) && value.fromIds.length > 0 && !value.fromIds.includes(value.entry.id);
     default:
       return false;
   }
@@ -363,10 +368,20 @@ function appendLedger(path, records) {
 }
 
 // src/ledger/fold.ts
+function resolveAliasId(folded, id) {
+  let current = id;
+  const seen = /* @__PURE__ */ new Set();
+  while (folded.aliases.has(current) && !seen.has(current)) {
+    seen.add(current);
+    current = folded.aliases.get(current);
+  }
+  return current;
+}
 function foldLedger(records) {
   const signalsById = /* @__PURE__ */ new Map();
   const entriesById = /* @__PURE__ */ new Map();
   const retractedIds = /* @__PURE__ */ new Set();
+  const aliases = /* @__PURE__ */ new Map();
   for (const record of records) {
     switch (record.type) {
       case "signal.recorded":
@@ -379,10 +394,18 @@ function foldLedger(records) {
       case "entry.retracted":
         retractedIds.add(record.entryId);
         break;
+      case "entry.merged":
+        entriesById.set(record.entry.id, record.entry);
+        retractedIds.delete(record.entry.id);
+        for (const fromId of record.fromIds) {
+          aliases.set(fromId, record.entry.id);
+          retractedIds.add(fromId);
+        }
+        break;
     }
   }
   const activeEntries = Array.from(entriesById.values()).filter((entry) => !retractedIds.has(entry.id));
-  return { signalsById, entriesById, retractedIds, activeEntries };
+  return { signalsById, entriesById, retractedIds, aliases, activeEntries };
 }
 
 // src/model-budget.ts
@@ -1280,16 +1303,20 @@ function buildGlobalEntry(args) {
   };
 }
 function reconcileCandidate(args) {
-  const id = tasteEntryId(args.candidate.content);
   const projectPath = ledgerPath(projectTasteDir(args.cwd));
-  const existing = foldLedger(readLedger(projectPath)).entriesById.get(id);
+  const folded = foldLedger(readLedger(projectPath));
+  const rawId = tasteEntryId(args.candidate.content);
+  const id = resolveAliasId(folded, rawId);
+  const redirected = id !== rawId;
+  const existing = folded.entriesById.get(id);
   const signalIds = uniqueStrings([...existing?.signalIds ?? [], args.candidate.signal.id]);
   const projectKeys = uniqueStrings([...existing?.projectKeys ?? [], args.projectKey]);
   const confidence = combineConfidence(existing?.confidence, args.candidate.confidence);
   const entry = {
     id,
-    content: args.candidate.content,
-    category: args.candidate.category,
+    // A redirect keeps the consolidated wording; the observation only reaffirms it.
+    content: redirected && existing ? existing.content : args.candidate.content,
+    category: redirected && existing ? existing.category : args.candidate.category,
     confidence,
     explicit: (existing?.explicit ?? false) || args.candidate.explicit,
     scope: "project",
@@ -1561,6 +1588,238 @@ function exportTasteMarkdown(cwd) {
   };
 }
 
+// src/agents/reflect/agent.ts
+import { agentLoop as agentLoop2 } from "@earendil-works/pi-agent-core";
+import { Type as Type2 } from "@earendil-works/pi-ai";
+
+// src/agents/reflect/prompts.ts
+var REFLECT_SYSTEM = `You are the taste-reflection agent for pi.
+
+You are given the user's currently active taste entries, each with an id, a category, and a one-line preference. Your job is consolidation: turn several narrow observations into fewer, better statements.
+
+Merge a group of entries when they express the same underlying preference, or when one is a more general version of the others. For each group:
+- write one imperative, single-line statement that preserves every distinct fact held by the group,
+- choose the single best category for the result,
+- cite the exact ids of every entry in the group.
+
+Do NOT:
+- invent a preference that is not present in the entries,
+- drop a fact that appears in only one of the merged entries,
+- merge entries that are merely about the same topic but express independent preferences,
+- merge an entry with itself, or reuse an entry in two different groups.
+
+Only propose a merge when the consolidated statement is genuinely better than keeping the entries separate. If nothing should be merged, do not call the tool and reply "no merges".`;
+
+// src/agents/reflect/agent.ts
+var ProposeMergesSchema = Type2.Object({
+  merges: Type2.Array(
+    Type2.Object({
+      fromIds: Type2.Array(Type2.String({ minLength: 1 }), {
+        minItems: 2,
+        description: "Ids of the active entries being consolidated, exactly as shown in the prompt. Never invent ids, and never reuse an entry across groups."
+      }),
+      content: Type2.String({
+        minLength: 1,
+        description: "One imperative single-line statement that preserves every distinct fact from the merged entries. No markdown, no tags."
+      }),
+      category: Type2.String({
+        minLength: 1,
+        description: "The single best category for the consolidated statement."
+      })
+    }),
+    { description: "Batch of consolidation proposals. Omit the tool call entirely when nothing should merge." }
+  )
+});
+var ReflectionStreamError = class extends Error {
+  stopReason;
+  constructor(stopReason, errorMessage) {
+    super(`reflection stream ended with stopReason "${stopReason}"${errorMessage ? `: ${errorMessage}` : ""}`);
+    this.name = "ReflectionStreamError";
+    this.stopReason = stopReason;
+  }
+};
+async function runReflection(args) {
+  if (args.entries.length < 2) return void 0;
+  const now = args.now ?? nowTimestamp;
+  const allowedIds = new Set(args.entries.map((entry) => entry.id));
+  const accumulated = /* @__PURE__ */ new Map();
+  const proposeMerges = {
+    name: "propose_merges",
+    label: "Propose merges",
+    description: "Propose groups of existing taste entries that should be consolidated into one statement. Call it as you work; stop when the entries are covered and reply with a short plain-text confirmation.",
+    parameters: ProposeMergesSchema,
+    execute: async (_id, params) => {
+      let added = 0;
+      let duplicates = 0;
+      let rejected = 0;
+      for (const candidate of params.merges) {
+        const fromIds = [...new Set(candidate.fromIds)];
+        if (fromIds.length < 2 || fromIds.some((id) => !allowedIds.has(id))) {
+          rejected++;
+          continue;
+        }
+        const key = [...fromIds].sort().join("|");
+        if (accumulated.has(key)) {
+          duplicates++;
+          continue;
+        }
+        accumulated.set(key, { fromIds, content: candidate.content, category: candidate.category });
+        added++;
+      }
+      const rejectedPart = rejected > 0 ? ` ${rejected} rejected for missing or invalid entry ids.` : "";
+      return {
+        content: [{
+          type: "text",
+          text: `Recorded ${added} merge proposal${added === 1 ? "" : "s"} ` + (duplicates > 0 ? `(${duplicates} duplicate${duplicates === 1 ? "" : "s"} skipped).` : ".") + rejectedPart + ` Total so far this run: ${accumulated.size}. Continue if more groups remain; otherwise stop calling the tool.`
+        }],
+        details: { added, duplicates, rejected, total: accumulated.size }
+      };
+    }
+  };
+  const entryList = args.entries.map((entry) => `[${entry.id}] (${entry.category}) ${entry.content}`).join("\n");
+  const userText = `Current local time: ${now()}
+
+Consolidate the active taste entries below by calling propose_merges. Cite entry ids exactly as shown. Categories: ${Object.keys(TASTE_CATEGORIES).join(", ")}.
+
+ACTIVE ENTRIES:
+${entryList}`;
+  const prompts = [
+    { role: "user", content: [{ type: "text", text: userText }], timestamp: Date.now() }
+  ];
+  const context = {
+    messages: [{ role: "system", content: REFLECT_SYSTEM, timestamp: Date.now() }],
+    tools: [proposeMerges]
+  };
+  const reasoning = args.model.reasoning;
+  const thinkingLevel = args.thinkingLevel ?? "low";
+  const effectiveMaxTurns = args.maxTurns && args.maxTurns > 0 ? args.maxTurns : void 0;
+  let turnCount = 0;
+  const config = {
+    model: args.model,
+    apiKey: args.apiKey,
+    headers: args.headers,
+    env: args.env,
+    maxTokens: boundedMaxTokens(args.model, args.maxOutputTokens ?? AGENT_LOOP_MAX_TOKENS),
+    convertToLlm: (messages) => messages,
+    toolExecution: "sequential",
+    ...reasoning && thinkingLevel !== "off" ? { reasoning: thinkingLevel } : {},
+    ...effectiveMaxTurns !== void 0 ? {
+      finishTurn: (turn) => {
+        if (turn.message.stopReason === "error" || turn.message.stopReason === "aborted") return;
+        turnCount++;
+        return turnCount >= effectiveMaxTurns ? { action: "end" } : void 0;
+      }
+    } : {}
+  };
+  const loop = args.agentLoop ?? agentLoop2;
+  const stream = loop(
+    prompts,
+    context,
+    config,
+    args.signal,
+    resolveWorkerStreamSimple(args.model, args.modelRegistry, args.streamSimple)
+  );
+  let streamError;
+  for await (const event of stream) {
+    args.usage?.addEvent(event);
+    logAgentStreamError("reflect", event);
+    const message = event.message;
+    if (message?.role === "assistant" && (message.stopReason === "error" || message.stopReason === "aborted")) {
+      streamError = { stopReason: message.stopReason, errorMessage: message.errorMessage };
+    }
+  }
+  await stream.result();
+  if (accumulated.size === 0) {
+    if (streamError) throw new ReflectionStreamError(streamError.stopReason, streamError.errorMessage);
+    return void 0;
+  }
+  return Array.from(accumulated.values());
+}
+
+// src/reflect.ts
+var CATEGORY_SET = new Set(Object.keys(TASTE_CATEGORIES));
+function singleLine(content) {
+  return content.replace(/\s+/gu, " ").trim();
+}
+function normalizeProposals(raw, entries, categories = CATEGORY_SET) {
+  const used = /* @__PURE__ */ new Set();
+  const proposals = [];
+  for (const proposal of raw) {
+    const fromIds = [...new Set(proposal.fromIds)];
+    if (fromIds.length < 2) continue;
+    if (!fromIds.every((id) => entries.has(id))) continue;
+    if (fromIds.some((id) => used.has(id))) continue;
+    const content = truncateRecordContent(singleLine(proposal.content));
+    if (!content) continue;
+    const category = categories.has(proposal.category) ? proposal.category : "general";
+    for (const id of fromIds) used.add(id);
+    proposals.push({ fromIds, content, category });
+  }
+  return proposals;
+}
+function buildMergedEntry(proposal, sources, now) {
+  const signalIds = [...new Set(sources.flatMap((source) => source.signalIds))];
+  const projectKeys = [...new Set(sources.flatMap((source) => source.projectKeys))];
+  const createdAt = sources.map((source) => source.createdAt).sort()[0] ?? now;
+  return {
+    id: tasteEntryId(proposal.content),
+    content: proposal.content,
+    category: proposal.category,
+    confidence: Math.max(...sources.map((source) => source.confidence)),
+    explicit: sources.some((source) => source.explicit),
+    scope: "project",
+    signalIds,
+    projectKeys,
+    createdAt,
+    updatedAt: now
+  };
+}
+async function runTasteReflect(runtime, ctx, deps = {}) {
+  runtime.ensureConfig(ctx.cwd);
+  const path = ledgerPath(projectTasteDir(ctx.cwd));
+  const active = foldLedger(readLedger(path)).activeEntries;
+  if (active.length < 2) {
+    return { entriesConsidered: active.length, merged: 0, entriesRetracted: 0, truncated: false };
+  }
+  const considered = [...active].sort((a, b) => b.updatedAt.localeCompare(a.updatedAt)).slice(0, runtime.config.reflectMaxEntries);
+  const truncated = considered.length < active.length;
+  const resolveModel = deps.resolveModel ?? resolveTasteModel;
+  const resolved = await resolveModel(runtime, {
+    model: ctx.model,
+    modelRegistry: ctx.modelRegistry,
+    stage: "reflect",
+    thinkingLevel: ctx.thinkingLevel
+  });
+  if (!resolved) throw new Error("no model available for taste reflection");
+  const reflect = deps.runReflection ?? runReflection;
+  const raw = await reflect({
+    model: resolved.model,
+    apiKey: resolved.apiKey,
+    headers: resolved.headers,
+    env: resolved.env,
+    entries: considered,
+    maxTurns: runtime.config.agentMaxTurns,
+    maxOutputTokens: runtime.config.agentMaxTokens,
+    thinkingLevel: resolved.thinking,
+    modelRegistry: ctx.modelRegistry
+  });
+  const allowed = new Map(considered.map((entry) => [entry.id, entry]));
+  const proposals = normalizeProposals(raw ?? [], allowed);
+  const at = (/* @__PURE__ */ new Date()).toISOString();
+  const records = [];
+  let entriesRetracted = 0;
+  for (const proposal of proposals) {
+    const sources = proposal.fromIds.map((id) => allowed.get(id));
+    const entry = buildMergedEntry(proposal, sources, at);
+    const fromIds = proposal.fromIds.filter((id) => id !== entry.id);
+    if (fromIds.length === 0) continue;
+    records.push({ type: "entry.merged", at, entry, fromIds });
+    entriesRetracted += fromIds.length;
+  }
+  if (records.length > 0) appendLedger(path, records);
+  return { entriesConsidered: considered.length, merged: records.length, entriesRetracted, truncated };
+}
+
 // src/time.ts
 function pad2(n) {
   return n.toString().padStart(2, "0");
@@ -1752,11 +2011,27 @@ function registerTasteCommand(pi, runtime) {
           return;
         }
         case "prune": {
+          let merged = 0;
+          let absorbed = 0;
+          let reflectNote = "";
+          try {
+            const reflected = await runTasteReflect(runtime, {
+              cwd: ctx.cwd,
+              model: ctx.model,
+              modelRegistry: ctx.modelRegistry,
+              thinkingLevel: ctx.thinkingLevel
+            });
+            merged = reflected.merged;
+            absorbed = reflected.entriesRetracted;
+            if (reflected.truncated) reflectNote = ` (reflected newest ${reflected.entriesConsidered})`;
+          } catch (error) {
+            reflectNote = ` (reflect unavailable: ${runtime.recordStageError("reflect", error)})`;
+          }
           try {
             const result = await runTastePrune(runtime, { cwd: ctx.cwd, modelRegistry: ctx.modelRegistry });
             const classifierNote = result.classifierError ? ` (classifier unavailable: ${result.classifierError})` : "";
             ctx.ui.notify(
-              `taste: retracted ${result.retractions.length} of ${result.total} entries${classifierNote}`,
+              `taste: merged ${merged} (${absorbed} absorbed), retracted ${result.retractions.length} of ${result.total} entries${reflectNote}${classifierNote}`,
               "info"
             );
           } catch (error) {
