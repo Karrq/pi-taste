@@ -1,5 +1,5 @@
 import type { ModelThinkingLevel } from "@earendil-works/pi-ai";
-import { TASTE_CATEGORIES } from "./agents/distill/questions.js";
+import { DEFAULT_CATEGORIES } from "./config.js";
 import { runReflection, type MergeProposal } from "./agents/reflect/agent.js";
 import {
 	appendLedger,
@@ -16,7 +16,7 @@ import { nowTimestamp, truncateRecordContent } from "./serialize.js";
 
 export type { MergeProposal };
 
-const CATEGORY_SET: ReadonlySet<string> = new Set(Object.keys(TASTE_CATEGORIES));
+const CATEGORY_SET: ReadonlySet<string> = new Set(Object.keys(DEFAULT_CATEGORIES));
 
 function singleLine(content: string): string {
 	return content.replace(/\s+/gu, " ").trim();
@@ -125,12 +125,14 @@ export async function runTasteReflect(
 	if (!resolved) throw new Error("no model available for taste reflection");
 
 	const reflect = deps.runReflection ?? runReflection;
+	const categories = runtime.config.categories;
 	const raw = await reflect({
 		model: resolved.model,
 		apiKey: resolved.apiKey,
 		headers: resolved.headers,
 		env: resolved.env,
 		entries: considered,
+		categories,
 		maxTurns: runtime.config.agentMaxTurns,
 		maxOutputTokens: runtime.config.agentMaxTokens,
 		thinkingLevel: resolved.thinking,
@@ -138,7 +140,7 @@ export async function runTasteReflect(
 	});
 
 	const allowed = new Map(considered.map((entry) => [entry.id, entry]));
-	const proposals = normalizeProposals(raw ?? [], allowed);
+	const proposals = normalizeProposals(raw ?? [], allowed, new Set(Object.keys(categories)));
 	const at = new Date().toISOString();
 	const records: LedgerRecord[] = [];
 	let entriesRetracted = 0;

@@ -58,6 +58,27 @@ export const CLASSIFIER_DEFAULTS: Readonly<ClassifierConfig> = {
 	requestTimeoutMs: 60_000,
 };
 
+/**
+ * The category set shipped as the default. It is ordinary config: whatever
+ * `taste.categories` resolves to is the complete vocabulary, and setting that
+ * key replaces this default rather than extending it.
+ */
+export const DEFAULT_CATEGORIES: Readonly<Record<string, string>> = {
+	formatting: "Whitespace, line width, quoting, and other purely stylistic conventions.",
+	naming: "Identifier, file, and symbol naming conventions.",
+	architecture: "Module boundaries, layering, abstraction, and code structure.",
+	typescript: "TypeScript and JavaScript typing and language usage.",
+	python: "Python-specific idioms and tooling.",
+	testing: "Test frameworks, structure, coverage, and what to test.",
+	"error-handling": "How errors, failures, and edge cases are handled.",
+	tooling: "Build tools, package managers, linters, formatters, CI.",
+	dependencies: "When and how to add or avoid dependencies.",
+	"api-design": "Function, module, and interface signatures.",
+	workflow: "How work is done: commits, branches, reviews, planning.",
+	communication: "How the assistant should talk: verbosity, format, tone.",
+	general: "A durable preference that fits none of the above.",
+};
+
 export interface Config {
 	/**
 	 * Master switch. When false nothing is injected. `/taste consolidate` and
@@ -66,6 +87,8 @@ export interface Config {
 	 */
 	enabled: boolean;
 	classifier: ClassifierConfig;
+	/** The complete category vocabulary. Defaults to `DEFAULT_CATEGORIES`; a set value replaces it. */
+	categories: Record<string, string>;
 	/** Entries below this confidence are not injected. */
 	injectionConfidenceFloor: number;
 	/** Approximate token budget for the injected `<taste>` section. */
@@ -93,6 +116,7 @@ export interface Config {
 export const DEFAULTS: Config = {
 	enabled: false,
 	classifier: { ...CLASSIFIER_DEFAULTS },
+	categories: { ...DEFAULT_CATEGORIES },
 	injectionConfidenceFloor: 0.5,
 	maxInjectedTokens: 1_200,
 	promoteAtProjectCount: 2,
@@ -134,6 +158,18 @@ function positiveInteger(value: unknown): number | undefined {
 
 function probability(value: unknown): number | undefined {
 	return typeof value === "number" && Number.isFinite(value) && value >= 0 && value <= 1 ? value : undefined;
+}
+
+/** Keep only named categories that carry a non-empty description. */
+function normalizeCategoryMap(value: unknown): Record<string, string> | undefined {
+	if (!isRecord(value)) return undefined;
+	const out: Record<string, string> = {};
+	for (const [rawName, rawDescription] of Object.entries(value)) {
+		const name = rawName.trim();
+		const description = typeof rawDescription === "string" ? rawDescription.trim() : "";
+		if (name && description) out[name] = description;
+	}
+	return Object.keys(out).length > 0 ? out : undefined;
 }
 
 /** Translate a `match` glob (`*`, `?`) into an anchored, case-insensitive RegExp. */
@@ -299,6 +335,8 @@ function normalizeSettingsConfig(value: Record<string, unknown>): NormalizedSett
 	if (modelMap) normalized.modelMap = modelMap;
 	const classifier = normalizeClassifierPartial(value.classifier);
 	if (classifier) normalized.classifier = classifier;
+	const categories = normalizeCategoryMap(value.categories);
+	if (categories) normalized.categories = categories;
 	return normalized;
 }
 
@@ -326,8 +364,86 @@ export function settingsPathFor(cwd: string, user = false): string {
 	return user ? join(getAgentDir(), "settings.json") : join(cwd, ".pi", "settings.json");
 }
 
+/** The full taste block with every value at its default; the shape written to settings. */
+export function defaultTasteSettings(): Record<string, unknown> {
+	return {
+		enabled: DEFAULTS.enabled,
+		classifier: { ...DEFAULTS.classifier },
+		categories: { ...DEFAULT_CATEGORIES },
+		injectionConfidenceFloor: DEFAULTS.injectionConfidenceFloor,
+		maxInjectedTokens: DEFAULTS.maxInjectedTokens,
+		promoteAtProjectCount: DEFAULTS.promoteAtProjectCount,
+		pruneConfidenceFloor: DEFAULTS.pruneConfidenceFloor,
+		consolidateMaxChunks: DEFAULTS.consolidateMaxChunks,
+		reflectMaxEntries: DEFAULTS.reflectMaxEntries,
+		agentMaxTurns: DEFAULTS.agentMaxTurns,
+		agentMaxTokens: DEFAULTS.agentMaxTokens,
+		modelMap: [],
+		debugLog: DEFAULTS.debugLog,
+		passive: DEFAULTS.passive,
+	};
+}
+
+/**
+ * Read the user `taste` block, filling every missing value from the defaults and
+ * writing the completed block back on first use. The settings file is the source
+ * of truth, so nothing is applied silently at runtime; the defaults exist only to
+ * seed a config that does not yet exist. Returns the filled block even when the
+ * file is read-only, so a session can still run.
+ */
+export function ensureTasteSettings(cwd: string): Record<string, unknown> {
+	const path = settingsPathFor(cwd, true);
+	const defaults = defaultTasteSettings();
+	let root: Record<string, unknown> = {};
+	if (existsSync(path)) {
+		try {
+			const parsed: unknown = JSON.parse(readFileSync(path, "utf-8"));
+			if (isRecord(parsed)) root = parsed;
+		} catch {
+			root = {};
+		}
+	}
+
+	const existing = isRecord(root[SETTINGS_KEY]) ? root[SETTINGS_KEY] as Record<string, unknown> : undefined;
+	let filled: Record<string, unknown>;
+	let dirty = false;
+	if (!existing) {
+		filled = defaults;
+		dirty = true;
+	} else {
+		filled = { ...existing };
+		for (const [key, value] of Object.entries(defaults)) {
+			if (filled[key] === undefined) {
+				filled[key] = value;
+				dirty = true;
+			}
+		}
+		const classifier = isRecord(filled.classifier) ? filled.classifier : {};
+		const withClassifierDefaults = { ...(defaults.classifier as Record<string, unknown>), ...classifier };
+		if (JSON.stringify(withClassifierDefaults) !== JSON.stringify(classifier)) dirty = true;
+		filled.classifier = withClassifierDefaults;
+		const categories = isRecord(filled.categories) && Object.keys(filled.categories).length > 0 ? filled.categories : undefined;
+		if (!categories) {
+			filled.categories = { ...DEFAULT_CATEGORIES };
+			dirty = true;
+		}
+	}
+
+	root[SETTINGS_KEY] = filled;
+	if (dirty) {
+		try {
+			mkdirSync(dirname(path), { recursive: true });
+			writeFileSync(path, `${JSON.stringify(root, null, 2)}\n`, "utf-8");
+		} catch {
+			// Read-only settings: run with the filled in-memory block.
+		}
+	}
+	return filled;
+}
+
 export function loadConfig(cwd: string, env: NodeJS.ProcessEnv = process.env): Config {
-	const globalConfig = readNamespacedConfig(settingsPathFor(cwd, true));
+	// Materializes the full default block on first use, then reads it back.
+	const globalConfig = normalizeSettingsConfig(ensureTasteSettings(cwd));
 	const projectConfig = readNamespacedConfig(settingsPathFor(cwd, false));
 	const envConfig = readEnvConfig(env);
 	const merged: Config = {
@@ -341,6 +457,8 @@ export function loadConfig(cwd: string, env: NodeJS.ProcessEnv = process.env): C
 			...projectConfig.classifier,
 			...(envConfig.classifier as Partial<ClassifierConfig> | undefined),
 		},
+		// Only configured categories exist; the defaults live in the settings file.
+		categories: projectConfig.categories ?? globalConfig.categories ?? {},
 		modelMap: projectConfig.modelMap ?? globalConfig.modelMap ?? DEFAULTS.modelMap,
 	};
 	return merged;

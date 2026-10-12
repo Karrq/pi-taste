@@ -79,6 +79,15 @@ describe("normalizeProposals", () => {
 		const proposals = normalizeProposals([{ fromIds: [a.id, b.id], content: "one\ntwo", category: "testing" }], known);
 		expect(proposals[0]?.content).toBe("one two");
 	});
+
+	it("accepts a user-defined category when it is in the vocabulary", () => {
+		const proposals = normalizeProposals(
+			[{ fromIds: [a.id, b.id], content: "x", category: "frontend" }],
+			known,
+			new Set(["frontend"]),
+		);
+		expect(proposals[0]?.category).toBe("frontend");
+	});
 });
 
 describe("buildMergedEntry", () => {

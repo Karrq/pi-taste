@@ -26,6 +26,8 @@ export interface DistillOptions {
 	registry?: ClassifierRegistry;
 	sessionId?: string;
 	signal?: AbortSignal;
+	/** Category choices for the classifier; the configured vocabulary. */
+	categories: Record<string, string>;
 }
 
 function clamp01(value: number): number {
@@ -77,15 +79,16 @@ export async function classifySignals(args: {
 	state: JsonObject;
 	signals: readonly Signal[];
 	config: ClassifierConfig;
+	categories: Record<string, string>;
 }): Promise<Map<string, DistillDecision>> {
-	const { classifier, state, signals, config } = args;
+	const { classifier, state, signals, config, categories } = args;
 	const decisions = new Map<string, DistillDecision>();
 	if (!classifier || signals.length === 0) return decisions;
 
 	const perChunk = Math.max(1, Math.floor(config.maxQuestionsPerRequest / SIGNAL_KEYS.length));
 	for (const chunk of chunked(signals, perChunk)) {
 		const questions: Record<string, ReturnType<typeof buildDistillQuestions>[string]> = {};
-		for (const signal of chunk) Object.assign(questions, buildDistillQuestions(signal.id));
+		for (const signal of chunk) Object.assign(questions, buildDistillQuestions(signal.id, categories));
 		const { answers } = await classifier(state, questions);
 		for (const [signalId, values] of collectAnswers(answers)) {
 			const decision = decisionFromAnswers(values, config.preferenceThreshold);
@@ -121,6 +124,7 @@ export async function distillSignals(options: DistillOptions): Promise<Distilled
 					state: buildDistillState({ project: options.project, signals }),
 					signals,
 					config,
+					categories: options.categories,
 				});
 				classifierUsed = true;
 			}

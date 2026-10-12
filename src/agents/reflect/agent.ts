@@ -5,7 +5,6 @@ import type { Static } from "typebox";
 import type { TasteEntry } from "../../ledger/index.js";
 import { AGENT_LOOP_MAX_TOKENS, boundedMaxTokens } from "../../model-budget.js";
 import { nowTimestamp } from "../../serialize.js";
-import { TASTE_CATEGORIES } from "../distill/questions.js";
 import { logAgentStreamError } from "../stream-errors.js";
 import { resolveWorkerStreamSimple, type StreamableModelRegistry, type WorkerStreamSimple } from "../worker-stream.js";
 import { REFLECT_SYSTEM } from "./prompts.js";
@@ -24,6 +23,8 @@ export interface RunReflectionArgs {
 	env?: Record<string, string>;
 	/** The active entries the model may cite; anything else is rejected. */
 	entries: readonly TasteEntry[];
+	/** Category choices named to the model; the configured vocabulary. */
+	categories: Record<string, string>;
 	signal?: AbortSignal;
 	agentLoop?: typeof agentLoop;
 	maxTurns?: number;
@@ -128,7 +129,7 @@ export async function runReflection(args: RunReflectionArgs): Promise<MergePropo
 	const entryList = args.entries.map((entry) => `[${entry.id}] (${entry.category}) ${entry.content}`).join("\n");
 	const userText = `Current local time: ${now()}
 
-Consolidate the active taste entries below by calling propose_merges. Cite entry ids exactly as shown. Categories: ${Object.keys(TASTE_CATEGORIES).join(", ")}.
+Consolidate the active taste entries below by calling propose_merges. Cite entry ids exactly as shown. Categories: ${Object.keys(args.categories).join(", ")}.
 
 ACTIVE ENTRIES:
 ${entryList}`;

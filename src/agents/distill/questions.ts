@@ -1,26 +1,6 @@
 import type { ClassifierAnswer, ClassifierQuestion, JsonObject } from "@earendil-works/pi-ai";
 import type { Signal } from "../../ledger/index.js";
 
-/**
- * Fixed category set. The classifier chooses from it; it cannot invent one,
- * which keeps the symbolic layer of the profile stable across runs.
- */
-export const TASTE_CATEGORIES: Record<string, string> = {
-	formatting: "Whitespace, line width, quoting, and other purely stylistic conventions.",
-	naming: "Identifier, file, and symbol naming conventions.",
-	architecture: "Module boundaries, layering, abstraction, and code structure.",
-	typescript: "TypeScript and JavaScript typing and language usage.",
-	python: "Python-specific idioms and tooling.",
-	testing: "Test frameworks, structure, coverage, and what to test.",
-	"error-handling": "How errors, failures, and edge cases are handled.",
-	tooling: "Build tools, package managers, linters, formatters, CI.",
-	dependencies: "When and how to add or avoid dependencies.",
-	"api-design": "Function, module, and interface signatures.",
-	workflow: "How work is done: commits, branches, reviews, planning.",
-	communication: "How the assistant should talk: verbosity, format, tone.",
-	general: "A durable preference that fits none of the above.",
-};
-
 export const SIGNAL_KEYS = ["is_preference", "category", "explicit", "confidence", "general"] as const;
 export type SignalKey = (typeof SIGNAL_KEYS)[number];
 
@@ -66,7 +46,10 @@ function about(signalId: string, question: string): string {
 	return `Consider the entry in \`signals\` whose id is \`${signalId}\`. ${question}`;
 }
 
-export function buildDistillQuestions(signalId: string): Record<string, ClassifierQuestion> {
+export function buildDistillQuestions(
+	signalId: string,
+	categories: Record<string, string>,
+): Record<string, ClassifierQuestion> {
 	return {
 		[questionKey(signalId, "is_preference")]: {
 			type: "bool",
@@ -82,7 +65,7 @@ export function buildDistillQuestions(signalId: string): Record<string, Classifi
 		[questionKey(signalId, "category")]: {
 			type: "choice",
 			instructions: about(signalId, "Which single category best fits the preference?"),
-			criteria: TASTE_CATEGORIES,
+			criteria: categories,
 		},
 		[questionKey(signalId, "explicit")]: {
 			type: "bool",

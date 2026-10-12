@@ -3,7 +3,7 @@ import { describe, expect, it } from "vitest";
 import { distillSignals } from "../src/agents/distill/index.js";
 import type { ClassifierRegistry } from "../src/agents/distill/classifier.js";
 import { buildDistillQuestions, collectAnswers, questionKey } from "../src/agents/distill/questions.js";
-import { CLASSIFIER_DEFAULTS } from "../src/config.js";
+import { CLASSIFIER_DEFAULTS, DEFAULT_CATEGORIES } from "../src/config.js";
 import { normalizeTasteContent, type Signal } from "../src/ledger/index.js";
 import { hashId } from "../src/ids.js";
 
@@ -45,7 +45,7 @@ function fakeRegistry(answers: Record<string, ClassifierAnswer>): ClassifierRegi
 
 describe("distill questions", () => {
 	it("builds the five typed questions for a signal", () => {
-		const questions = buildDistillQuestions("s1");
+		const questions = buildDistillQuestions("s1", DEFAULT_CATEGORIES);
 		expect(Object.keys(questions).sort()).toEqual([
 			"s1::category",
 			"s1::confidence",
@@ -69,6 +69,7 @@ describe("distillSignals", () => {
 		const candidates = await distillSignals({
 			signals: [signal],
 			project: "p",
+			categories: DEFAULT_CATEGORIES,
 			config: { ...CLASSIFIER_DEFAULTS, mode: "off" },
 		});
 		expect(candidates[0]?.category).toBe("general");
@@ -80,6 +81,7 @@ describe("distillSignals", () => {
 		const candidates = await distillSignals({
 			signals: [signal],
 			project: "p",
+			categories: DEFAULT_CATEGORIES,
 			config: { ...CLASSIFIER_DEFAULTS, mode: "primary" },
 			registry: fakeRegistry(answersFor(signal.id)),
 		});
@@ -92,6 +94,7 @@ describe("distillSignals", () => {
 		const candidates = await distillSignals({
 			signals: [signal],
 			project: "p",
+			categories: DEFAULT_CATEGORIES,
 			config: { ...CLASSIFIER_DEFAULTS, mode: "shadow" },
 			registry: fakeRegistry(answersFor(signal.id)),
 		});
@@ -110,6 +113,7 @@ describe("distillSignals", () => {
 		const candidates = await distillSignals({
 			signals: [signal],
 			project: "p",
+			categories: DEFAULT_CATEGORIES,
 			config: { ...CLASSIFIER_DEFAULTS, mode: "primary" },
 			registry,
 		});

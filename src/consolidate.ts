@@ -153,6 +153,7 @@ export async function runTasteConsolidation(
 					config: runtime.config.classifier,
 					registry: ctx.modelRegistry as ClassifierRegistry | undefined,
 					sessionId,
+					categories: runtime.config.categories,
 				});
 				const now = new Date().toISOString();
 				for (const candidate of candidates) {
