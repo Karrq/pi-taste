@@ -13,6 +13,7 @@ export interface RememberArgs {
 	promoteAtProjectCount: number;
 	sessionId?: string;
 	now?: Date;
+	opId?: string;
 }
 
 export interface RememberResult {
@@ -48,9 +49,14 @@ export function rememberPreference(args: RememberArgs): RememberResult {
 		projectKey,
 		promoteAtProjectCount: args.promoteAtProjectCount,
 		now: at,
+		...(args.opId ? { opId: args.opId } : {}),
 	});
 
-	appendLedger(ledgerPath(projectTasteDir(args.cwd)), [{ type: "signal.recorded", at, signal }, ...projectRecords]);
+	const op = args.opId ? { opId: args.opId } : {};
+	appendLedger(ledgerPath(projectTasteDir(args.cwd)), [
+		{ type: "signal.recorded", at, signal, ...op },
+		...projectRecords,
+	]);
 	if (globalRecords.length > 0) appendLedger(ledgerPath(globalTasteDir()), globalRecords);
 
 	return { signal, entry, globalRecords };

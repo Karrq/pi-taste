@@ -86,6 +86,7 @@ describe("runTasteConsolidation", () => {
 	it("drains the branch, writes signals, and advances coverage", async () => {
 		const entries = [message("m1", "always use tabs"), message("m2", "never use default exports")];
 		const { pi, appended, runtime, ctx } = harness(entries);
+		ctx.opId = "op-test";
 
 		const summary = await runTasteConsolidation(pi, runtime, ctx, {
 			resolveModel: async () => ({ model: {} }),
@@ -96,8 +97,10 @@ describe("runTasteConsolidation", () => {
 		expect(appended).toHaveLength(1);
 		expect(appended[0]?.customType).toBe(TASTE_COVERAGE);
 		expect((appended[0]?.data as { coversUpToId: string }).coversUpToId).toBe("m2");
+		expect((appended[0]?.data as { opId?: string }).opId).toBe("op-test");
 		const records = readLedger(ledgerPath(projectTasteDir(ctx.cwd)));
 		expect(records.filter((record) => record.type === "signal.recorded")).toHaveLength(1);
+		expect(records.every((record) => record.opId === "op-test")).toBe(true);
 	});
 
 	it("stops at the chunk cap and reports that more remain", async () => {

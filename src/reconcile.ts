@@ -84,6 +84,7 @@ export function reconcileCandidate(args: {
 	projectKey: string;
 	promoteAtProjectCount: number;
 	now: string;
+	opId?: string;
 }): ReconcileResult {
 	const projectPath = ledgerPath(projectTasteDir(args.cwd));
 	const folded = foldLedger(readLedger(projectPath));
@@ -112,7 +113,8 @@ export function reconcileCandidate(args: {
 		createdAt: existing?.createdAt ?? args.now,
 		updatedAt: args.now,
 	};
-	const projectRecords: LedgerRecord[] = [{ type: "entry.upserted", at: args.now, entry }];
+	const op = args.opId ? { opId: args.opId } : {};
+	const projectRecords: LedgerRecord[] = [{ type: "entry.upserted", at: args.now, entry, ...op }];
 
 	const aggregate = aggregateAcrossProjects(id);
 	const mergedKeys = uniqueStrings([...aggregate.projectKeys, ...projectKeys]);
@@ -131,6 +133,7 @@ export function reconcileCandidate(args: {
 				now: args.now,
 				...(globalExisting ? { existing: globalExisting } : {}),
 			}),
+			...op,
 		});
 	}
 

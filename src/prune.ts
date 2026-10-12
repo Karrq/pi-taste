@@ -159,12 +159,17 @@ export async function pruneEntries(options: PruneOptions): Promise<PruneResult> 
 	};
 }
 
-export function retractionRecords(retractions: readonly PruneRetraction[], at: string): LedgerRecord[] {
+export function retractionRecords(
+	retractions: readonly PruneRetraction[],
+	at: string,
+	opId?: string,
+): LedgerRecord[] {
 	return retractions.map((retraction) => ({
 		type: "entry.retracted",
 		at,
 		entryId: retraction.entryId,
 		reason: retraction.reason,
+		...(opId ? { opId } : {}),
 	}));
 }
 
@@ -175,7 +180,7 @@ export interface PruneRunResult extends PruneResult {
 /** Prune one ledger's active entries and append the tombstones. */
 export async function runTastePrune(
 	runtime: Runtime,
-	args: { cwd: string; modelRegistry?: unknown; now?: string },
+	args: { cwd: string; modelRegistry?: unknown; now?: string; opId?: string; scope?: TasteScope },
 ): Promise<PruneRunResult> {
 	runtime.ensureConfig(args.cwd);
 	const scope = args.scope ?? "project";
@@ -203,7 +208,7 @@ export async function runTastePrune(
 		maxQuestionsPerRequest: runtime.config.classifier.maxQuestionsPerRequest,
 	});
 	if (result.retractions.length > 0) {
-		appendLedger(path, retractionRecords(result.retractions, args.now ?? new Date().toISOString()));
+		appendLedger(path, retractionRecords(result.retractions, args.now ?? new Date().toISOString(), args.opId));
 	}
 	return { ...result, total: active.length };
 }

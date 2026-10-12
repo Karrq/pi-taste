@@ -82,6 +82,8 @@ export interface ReflectCtx {
 	model?: unknown;
 	modelRegistry: unknown;
 	thinkingLevel?: ModelThinkingLevel;
+	/** Groups this run's ledger writes so `/taste undo` can remove them together. */
+	opId?: string;
 	/** Which ledger to reflect. Defaults to the project layer. */
 	scope?: TasteScope;
 }
@@ -160,7 +162,7 @@ export async function runTasteReflect(
 		// keeps the id and must not be tombstoned, so it is dropped from `fromIds`.
 		const fromIds = proposal.fromIds.filter((id) => id !== entry.id);
 		if (fromIds.length === 0) continue;
-		records.push({ type: "entry.merged", at, entry, fromIds });
+		records.push({ type: "entry.merged", at, entry, fromIds, ...(ctx.opId ? { opId: ctx.opId } : {}) });
 		entriesRetracted += fromIds.length;
 	}
 	if (records.length > 0) appendLedger(path, records);

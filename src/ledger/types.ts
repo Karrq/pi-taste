@@ -47,12 +47,18 @@ export interface TasteEntry {
 	updatedAt: string;
 }
 
+/** A command invocation id, shared by every record that invocation writes. */
+export interface LedgerOp {
+	/** Set when the record came from a user command, so `/taste undo` can group it. */
+	opId?: string;
+}
+
 export type LedgerRecord =
-	| { type: "signal.recorded"; at: string; signal: Signal }
-	| { type: "entry.upserted"; at: string; entry: TasteEntry }
-	| { type: "entry.retracted"; at: string; entryId: string; reason: string }
+	| ({ type: "signal.recorded"; at: string; signal: Signal } & LedgerOp)
+	| ({ type: "entry.upserted"; at: string; entry: TasteEntry } & LedgerOp)
+	| ({ type: "entry.retracted"; at: string; entryId: string; reason: string } & LedgerOp)
 	/** A consolidation: `entry` replaces `fromIds`, which are tombstoned and aliased to it. */
-	| { type: "entry.merged"; at: string; entry: TasteEntry; fromIds: string[] };
+	| ({ type: "entry.merged"; at: string; entry: TasteEntry; fromIds: string[] } & LedgerOp);
 
 /** Stable identity for a taste statement: case, whitespace and trailing punctuation insensitive. */
 export function normalizeTasteContent(content: string): string {

@@ -11,6 +11,8 @@ import { aggregateAcrossProjects, buildGlobalEntry } from "../reconcile.js";
 import { runTasteReflect } from "../reflect.js";
 import { rememberPreference } from "../remember.js";
 import { findEntry } from "../select.js";
+import { TASTE_COVERAGE_RESET, planCoverageUndo } from "../session/coverage.js";
+import type { SessionEntry } from "../session/types.js";
 import { mergeTasteEntries, renderTasteSection } from "../render/taste-section.js";
 import type { Runtime } from "../runtime.js";
 import { refreshTasteSnapshot } from "../taste-snapshot.js";
@@ -109,6 +111,7 @@ export function registerTasteCommand(pi: ExtensionAPI, runtime: Runtime): void {
 						text: selector,
 						promoteAtProjectCount: runtime.config.promoteAtProjectCount,
 						...(sessionId ? { sessionId } : {}),
+						opId: newOpId(),
 					});
 					ctx.ui.notify(`taste: recorded "${selector}" (100%, explicit)`, "info");
 					return;
@@ -121,7 +124,13 @@ export function registerTasteCommand(pi: ExtensionAPI, runtime: Runtime): void {
 					}
 					const path = ledgerPath(entry.scope === "global" ? globalTasteDir() : projectTasteDir(ctx.cwd));
 					appendLedger(path, [
-						{ type: "entry.retracted", at: new Date().toISOString(), entryId: entry.id, reason: "forgotten by user" },
+						{
+							type: "entry.retracted",
+							at: new Date().toISOString(),
+							entryId: entry.id,
+							reason: "forgotten by user",
+							opId: newOpId(),
+						},
 					]);
 					ctx.ui.notify(`taste: forgot "${entry.content}"`, "info");
 					return;
@@ -148,6 +157,7 @@ export function registerTasteCommand(pi: ExtensionAPI, runtime: Runtime): void {
 								now: at,
 								...(existing ? { existing } : {}),
 							}),
+							opId: newOpId(),
 						},
 					]);
 					ctx.ui.notify(`taste: promoted "${entry.content}" to global`, "info");
@@ -241,6 +251,57 @@ export function registerTasteCommand(pi: ExtensionAPI, runtime: Runtime): void {
 					} finally {
 						runtime.runInFlight = false;
 					}
+					return;
+				}
+				case "undo": {
+					const count = selector ? Number.parseInt(selector, 10) : 1;
+					if (!Number.isFinite(count) || count < 1) {
+						ctx.ui.notify("taste: undo [n] [--dry]", "warning");
+						return;
+					}
+					const result = undoLastOps(ctx.cwd, count, { dryRun: dry });
+					if (!result.changed) {
+						ctx.ui.notify("taste: nothing to undo", "info");
+						return;
+					}
+					// Coverage lives in session entries, which cannot be deleted, so a run
+					// that extracted is rewound by appending a reset marker.
+					const branch = ctx.sessionManager.getBranch() as SessionEntry[];
+					const coverage = planCoverageUndo(branch, result.opIds);
+					const coverageNote = coverage
+						? `, rewound coverage over ${coverage.removed} chunk${coverage.removed === 1 ? "" : "s"}`
+						: "";
+					const opLabel = `${result.opIds.length} ${plural(result.opIds.length, "operation", "operations")}`;
+					const recordLabel = `${result.recordsRemoved} ${plural(result.recordsRemoved, "record", "records")}`;
+
+					if (dry) {
+						const lines = result.records.flatMap((record) => {
+							const head = `  ${record.file} - ${record.summary}`;
+							const restored = (record.sources ?? []).map((source) => `      + [${source.category}] ${source.content}`);
+							return [head, ...restored];
+						});
+						if (coverage) {
+							const target = coverage.coversUpToId ? `to ${coverage.coversUpToId}` : "(clear coverage)";
+							lines.push(`  coverage: rewind ${coverage.removed} chunk${coverage.removed === 1 ? "" : "s"} ${target}`);
+						}
+						ctx.ui.notify(
+							`taste: dry run \u2014 would remove ${opLabel} (${recordLabel})\n${lines.join("\n")}`,
+							"info",
+						);
+						return;
+					}
+
+					if (coverage) {
+						pi.appendEntry(
+							TASTE_COVERAGE_RESET,
+							coverage.coversUpToId ? { coversUpToId: coverage.coversUpToId } : {},
+						);
+					}
+					syncTasteSnapshot(pi, runtime, ctx.cwd);
+					ctx.ui.notify(
+						`taste: undid ${opLabel} (${recordLabel} removed${coverageNote})`,
+						"info",
+					);
 					return;
 				}
 				case "status": {

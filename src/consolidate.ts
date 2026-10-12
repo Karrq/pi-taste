@@ -34,6 +34,7 @@ export interface ConsolidationCtx {
 		getSessionId?(): string | undefined;
 		getSessionFile?(): string | undefined;
 	};
+	opId?: string;
 }
 
 export interface ConsolidationDeps {
@@ -139,6 +140,7 @@ export async function runTasteConsolidation(
 				type: "signal.recorded",
 				at: new Date().toISOString(),
 				signal,
+				...(ctx.opId ? { opId: ctx.opId } : {}),
 			}));
 			appendLedger(path, records);
 			signalsRecorded += signals.length;
@@ -163,6 +165,7 @@ export async function runTasteConsolidation(
 						projectKey,
 						promoteAtProjectCount: runtime.config.promoteAtProjectCount,
 						now,
+						...(ctx.opId ? { opId: ctx.opId } : {}),
 					});
 					appendLedger(path, projectRecords);
 					if (globalRecords.length > 0) appendLedger(ledgerPath(globalTasteDir()), globalRecords);
@@ -173,7 +176,11 @@ export async function runTasteConsolidation(
 			}
 		}
 
-		const data: TasteCoverageData = { coversUpToId, signalCount: signals?.length ?? 0 };
+		const data: TasteCoverageData = {
+			coversUpToId,
+			signalCount: signals?.length ?? 0,
+			...(ctx.opId ? { opId: ctx.opId } : {}),
+		};
 		pi.appendEntry(TASTE_COVERAGE, data);
 
 		const next = indexById.get(coversUpToId);
@@ -193,6 +200,7 @@ export async function runTasteConsolidation(
 		entriesRetracted = pruned.retractions.length;
 	} catch (error) {
 		runtime.recordStageError("prune", error);
+				...(ctx.opId ? { opId: ctx.opId } : {}),
 	}
 
 	return { chunks, signalsRecorded, entriesUpserted, entriesRetracted, reachedEnd };
