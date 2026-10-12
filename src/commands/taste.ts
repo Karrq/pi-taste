@@ -15,7 +15,7 @@ import { TASTE_COVERAGE_RESET, planCoverageUndo } from "../session/coverage.js";
 import type { SessionEntry } from "../session/types.js";
 import { mergeTasteEntries, renderTasteSection } from "../render/taste-section.js";
 import type { Runtime } from "../runtime.js";
-import { refreshTasteSnapshot } from "../taste-snapshot.js";
+import { syncTasteSnapshot } from "../taste-snapshot.js";
 
 const HELP = [
 	"taste: status | enable [--project] | disable [--project] | view | consolidate | prune",
@@ -89,11 +89,15 @@ export function registerTasteCommand(pi: ExtensionAPI, runtime: Runtime): void {
 				case "enable":
 				case "disable": {
 					const enabled = sub === "enable";
-					const path = setTasteEnabled({ cwd: ctx.cwd, enabled, scope: project ? "project" : "user" });
+					setTasteEnabled({ cwd: ctx.cwd, enabled, scope: project ? "project" : "user" });
 					runtime.reloadConfig();
 					runtime.ensureConfig(ctx.cwd);
-					refreshTasteSnapshot(runtime, ctx.cwd);
-					ctx.ui.notify(`taste: ${enabled ? "enabled" : "disabled"} (${project ? "project" : "user"}: ${path})`, "info");
+					// The snapshot entry records the state. Only notify when no entry was
+					// written, so the command is never a silent no-op.
+					const result = syncTasteSnapshot(pi, runtime, ctx.cwd);
+					if (!result.changed && !result.section) {
+						ctx.ui.notify(`taste: ${enabled ? "enabled" : "disabled"}`, "info");
+					}
 					return;
 				}
 				case "view": {
