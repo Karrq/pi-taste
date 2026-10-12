@@ -8,8 +8,9 @@ import {
 	tasteEntryId,
 	type LedgerRecord,
 	type TasteEntry,
+	type TasteScope,
 } from "./ledger/index.js";
-import { ledgerPath, projectTasteDir } from "./ledger/paths.js";
+import { globalTasteDir, ledgerPath, projectTasteDir } from "./ledger/paths.js";
 import { resolveTasteModel } from "./model-resolver.js";
 import type { Runtime } from "./runtime.js";
 import { nowTimestamp, truncateRecordContent } from "./serialize.js";
@@ -53,7 +54,12 @@ export function normalizeProposals(
  * probabilistic OR: a merge re-words the same evidence, so OR would inflate the
  * profile without any new observation.
  */
-export function buildMergedEntry(proposal: MergeProposal, sources: readonly TasteEntry[], now: string): TasteEntry {
+export function buildMergedEntry(
+	proposal: MergeProposal,
+	sources: readonly TasteEntry[],
+	now: string,
+	scope: TasteScope = "project",
+): TasteEntry {
 	const signalIds = [...new Set(sources.flatMap((source) => source.signalIds))];
 	const projectKeys = [...new Set(sources.flatMap((source) => source.projectKeys))];
 	const createdAt = sources.map((source) => source.createdAt).sort()[0] ?? now;
@@ -63,7 +69,7 @@ export function buildMergedEntry(proposal: MergeProposal, sources: readonly Tast
 		category: proposal.category,
 		confidence: Math.max(...sources.map((source) => source.confidence)),
 		explicit: sources.some((source) => source.explicit),
-		scope: "project",
+		scope,
 		signalIds,
 		projectKeys,
 		createdAt,
@@ -76,6 +82,8 @@ export interface ReflectCtx {
 	model?: unknown;
 	modelRegistry: unknown;
 	thinkingLevel?: ModelThinkingLevel;
+	/** Which ledger to reflect. Defaults to the project layer. */
+	scope?: TasteScope;
 }
 
 export interface ReflectDeps {
@@ -104,7 +112,8 @@ export async function runTasteReflect(
 	deps: ReflectDeps = {},
 ): Promise<ReflectSummary> {
 	runtime.ensureConfig(ctx.cwd);
-	const path = ledgerPath(projectTasteDir(ctx.cwd));
+	const scope = ctx.scope ?? "project";
+	const path = ledgerPath(scope === "global" ? globalTasteDir() : projectTasteDir(ctx.cwd));
 	const active = foldLedger(readLedger(path)).activeEntries;
 	if (active.length < 2) {
 		return { entriesConsidered: active.length, merged: 0, entriesRetracted: 0, truncated: false };
@@ -146,7 +155,7 @@ export async function runTasteReflect(
 	let entriesRetracted = 0;
 	for (const proposal of proposals) {
 		const sources = proposal.fromIds.map((id) => allowed.get(id) as TasteEntry);
-		const entry = buildMergedEntry(proposal, sources, at);
+		const entry = buildMergedEntry(proposal, sources, at, scope);
 		// The rewritten statement can match one source word-for-word. That source
 		// keeps the id and must not be tombstoned, so it is dropped from `fromIds`.
 		const fromIds = proposal.fromIds.filter((id) => id !== entry.id);

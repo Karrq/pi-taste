@@ -2,8 +2,8 @@ import type { ClassifierQuestion, JsonObject } from "@earendil-works/pi-ai";
 import type { ClassifierRegistry, Classify } from "./agents/distill/classifier.js";
 import { resolveClassifier } from "./agents/distill/classifier.js";
 import { appendLedger, foldLedger, readLedger } from "./ledger/index.js";
-import { ledgerPath, projectTasteDir } from "./ledger/paths.js";
-import type { LedgerRecord, TasteEntry } from "./ledger/index.js";
+import { globalTasteDir, ledgerPath, projectTasteDir } from "./ledger/paths.js";
+import type { LedgerRecord, TasteEntry, TasteScope } from "./ledger/index.js";
 import type { Runtime } from "./runtime.js";
 
 /** A bool answer at or above this counts as a genuine contradiction. */
@@ -172,13 +172,14 @@ export interface PruneRunResult extends PruneResult {
 	total: number;
 }
 
-/** Prune the project ledger's active entries and append the tombstones. */
+/** Prune one ledger's active entries and append the tombstones. */
 export async function runTastePrune(
 	runtime: Runtime,
 	args: { cwd: string; modelRegistry?: unknown; now?: string },
 ): Promise<PruneRunResult> {
 	runtime.ensureConfig(args.cwd);
-	const path = ledgerPath(projectTasteDir(args.cwd));
+	const scope = args.scope ?? "project";
+	const path = ledgerPath(scope === "global" ? globalTasteDir() : projectTasteDir(args.cwd));
 	const active = foldLedger(readLedger(path)).activeEntries;
 
 	let classifier: Classify | undefined;

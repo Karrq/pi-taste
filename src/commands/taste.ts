@@ -162,33 +162,51 @@ export function registerTasteCommand(pi: ExtensionAPI, runtime: Runtime): void {
 					return;
 				}
 				case "prune": {
+					const opId = newOpId();
+					const scopes: TasteScope[] = global ? ["project", "global"] : ["project"];
 					let merged = 0;
 					let absorbed = 0;
-					let reflectNote = "";
-					try {
-						const reflected = await runTasteReflect(runtime, {
-							cwd: ctx.cwd,
-							model: ctx.model,
-							modelRegistry: ctx.modelRegistry,
-							thinkingLevel: ctx.thinkingLevel,
-						});
-						merged = reflected.merged;
-						absorbed = reflected.entriesRetracted;
-						if (reflected.truncated) reflectNote = ` (reflected newest ${reflected.entriesConsidered})`;
-					} catch (error) {
-						reflectNote = ` (reflect unavailable: ${runtime.recordStageError("reflect", error)})`;
+					let retracted = 0;
+					let total = 0;
+					const notes: string[] = [];
+					for (const scope of scopes) {
+						try {
+							const reflected = await runTasteReflect(runtime, {
+								cwd: ctx.cwd,
+								model: ctx.model,
+								modelRegistry: ctx.modelRegistry,
+								thinkingLevel: ctx.thinkingLevel,
+								opId,
+								scope,
+							});
+							merged += reflected.merged;
+							absorbed += reflected.entriesRetracted;
+							if (reflected.truncated) notes.push(`${scope}: reflected newest ${reflected.entriesConsidered}`);
+						} catch (error) {
+							notes.push(`${scope}: reflect unavailable (${runtime.recordStageError("reflect", error)})`);
+						}
+						try {
+							const result = await runTastePrune(runtime, {
+								cwd: ctx.cwd,
+								modelRegistry: ctx.modelRegistry,
+								opId,
+								scope,
+							});
+							retracted += result.retractions.length;
+							total += result.total;
+							if (result.classifierError) notes.push(`${scope}: classifier unavailable (${result.classifierError})`);
+						} catch (error) {
+							ctx.ui.notify(`taste: ${scope} prune failed: ${runtime.recordStageError("prune", error)}`, "warning");
+							return;
+						}
 					}
-					try {
-						const result = await runTastePrune(runtime, { cwd: ctx.cwd, modelRegistry: ctx.modelRegistry });
-						const classifierNote = result.classifierError ? ` (classifier unavailable: ${result.classifierError})` : "";
-						ctx.ui.notify(
-							`taste: merged ${merged} (${absorbed} absorbed), `
-							+ `retracted ${result.retractions.length} of ${result.total} entries${reflectNote}${classifierNote}`,
-							"info",
-						);
-					} catch (error) {
-						ctx.ui.notify(`taste: prune failed: ${runtime.recordStageError("prune", error)}`, "warning");
-					}
+					const scopeLabel = global ? " (project + global)" : "";
+					const note = notes.length > 0 ? ` [${notes.join("; ")}]` : "";
+					ctx.ui.notify(
+						`taste: merged ${merged} (${absorbed} absorbed), `
+						+ `retracted ${retracted} of ${total} entries${scopeLabel}${note}`,
+						"info",
+					);
 					return;
 				}
 				case "consolidate": {
