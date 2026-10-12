@@ -1,8 +1,14 @@
-import type { ExtensionAPI, ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
-import { setTasteEnabled } from "../config.js";
-import { runTasteConsolidation } from "../consolidate.js";
+import type { ExtensionAPI, ExtensionCommandContext, Theme } from "@earendil-works/pi-coding-agent";
+import { DynamicBorder, keyText } from "@earendil-works/pi-coding-agent";
+import type { TUI } from "@earendil-works/pi-tui";
+import { Container, Loader, matchesKey, Spacer, Text } from "@earendil-works/pi-tui";
+import { DEFAULT_CATEGORIES, resolveModelString, setTasteEnabled, type ConfiguredModel } from "../config.js";
+import { newOpId } from "../ids.js";
+import { undoLastOps } from "../undo.js";
+import { runTasteConsolidation, type ConsolidationProgress } from "../consolidate.js";
 import { exportTasteMarkdown } from "../export.js";
-import { foldLedger, type TasteEntry } from "../ledger/index.js";
+import { foldLedger, type TasteEntry, type TasteScope } from "../ledger/index.js";
+import { normalizeTasteContent } from "../ledger/types.js";
 import { appendLedger } from "../ledger/store.js";
 import { globalTasteDir, ledgerPath, projectTasteDir } from "../ledger/paths.js";
 import { readLedger } from "../ledger/store.js";
@@ -17,15 +23,112 @@ import { mergeTasteEntries, renderTasteSection } from "../render/taste-section.j
 import type { Runtime } from "../runtime.js";
 import { syncTasteSnapshot } from "../taste-snapshot.js";
 
-const HELP = [
-	"taste: status | enable [--project] | disable [--project] | view | consolidate | prune",
-	"       remember <text> | forget <text | id:...> | promote <text | id:...> | export",
-].join("\n");
+interface TasteSubcommand {
+	name: string;
+	usage: string;
+	description: string;
+}
 
-function parseArgs(args: string): { parts: string[]; project: boolean } {
+const SUBCOMMANDS: TasteSubcommand[] = [
+	{ name: "status", usage: "status", description: "Enabled state, entry counts, classifier mode" },
+	{ name: "model", usage: "model [<provider/id[:thinking]> | reset]", description: "Override the worker model for this session" },
+	{ name: "enable", usage: "enable [--project]", description: "Turn taste on and refresh the snapshot" },
+	{ name: "disable", usage: "disable [--project]", description: "Turn taste off; nothing is injected" },
+	{ name: "view", usage: "view", description: "List merged project and global entries" },
+	{ name: "consolidate", usage: "consolidate", description: "Extract, distill, reconcile, prune on this branch" },
+	{ name: "prune", usage: "prune [--global]", description: "Merge related entries, retract contradictions" },
+	{ name: "remember", usage: "remember <text>", description: "Record a preference explicitly at full confidence" },
+	{ name: "category", usage: "category <text | id:...> <category>", description: "Reassign an entry's category" },
+	{ name: "forget", usage: "forget <text | id:...>", description: "Retract one entry by text or id" },
+	{ name: "undo", usage: "undo [n] [--dry]", description: "Remove the last n operations (default 1) from the ledger" },
+	{ name: "promote", usage: "promote <text | id:...>", description: "Force an entry into the global layer" },
+	{ name: "export", usage: "export", description: "Write ./taste.md with the merged view" },
+	{ name: "help", usage: "help", description: "Show this command list" },
+];
+
+function helpText(): string {
+	const width = Math.max(...SUBCOMMANDS.map((sub) => sub.usage.length));
+	const lines = SUBCOMMANDS.map((sub) => `  ${sub.usage.padEnd(width)}  ${sub.description}`);
+	return ["taste: usage", ...lines].join("\n");
+}
+
+function subcommandCompletions(argumentPrefix: string) {
+	const prefix = argumentPrefix.trimStart();
+	// Only complete the first token; leave later arguments (text, id:...) alone.
+	if (prefix.includes(" ")) return null;
+	const query = prefix.toLowerCase();
+	const matches = SUBCOMMANDS.filter((sub) => sub.name.startsWith(query));
+	if (matches.length === 0) return null;
+	return matches.map((sub) => ({ value: sub.name, label: sub.name, description: sub.description }));
+}
+
+function parseArgs(args: string): { parts: string[]; project: boolean; global: boolean; dry: boolean } {
 	const all = args.trim().split(/\s+/u).filter(Boolean);
 	const project = all.includes("--project");
-	return { parts: all.filter((part) => part !== "--project"), project };
+	const global = all.includes("--global");
+	const dry = all.includes("--dry");
+	return {
+		parts: all.filter((part) => part !== "--project" && part !== "--global" && part !== "--dry"),
+		project,
+		global,
+		dry,
+	};
+}
+
+/**
+ * Editor-area takeover shown while an explicit `/taste consolidate` runs. It is
+ * mounted through `ctx.ui.custom`, which clears the editor and restores it when
+ * the command finishes, mirroring the loader `/share` uses.
+ */
+class ConsolidationLoader extends Container {
+	private readonly loader: Loader;
+	private cancelling = false;
+
+	constructor(tui: TUI, theme: Theme, message: string, private readonly onCancel: () => void) {
+		const border = (text: string) => theme.fg("accent", text);
+		super();
+		this.addChild(new DynamicBorder(border));
+		this.loader = new Loader(tui, (text) => theme.fg("accent", text), (text) => theme.fg("muted", text), message);
+		this.addChild(this.loader);
+		this.addChild(new Spacer(1));
+		this.addChild(new Text(theme.fg("dim", `${keyText("tui.select.cancel")} cancel`), 1, 0));
+		this.addChild(new Spacer(1));
+		this.addChild(new DynamicBorder(border));
+	}
+
+	setMessage(message: string): void {
+		this.loader.setMessage(message);
+	}
+
+	handleInput(data: string): void {
+		if (this.cancelling) return;
+		if (matchesKey(data, "escape") || matchesKey(data, "ctrl+c")) {
+			this.cancelling = true;
+			this.loader.setMessage("taste: cancelling…");
+			this.onCancel();
+		}
+	}
+
+	dispose(): void {
+		this.loader.stop();
+	}
+}
+
+function plural(count: number, singular: string, pluralForm: string): string {
+	return count === 1 ? singular : pluralForm;
+}
+
+function formatConfiguredModel(model: ConfiguredModel): string {
+	return `${model.provider}/${model.id}${model.thinking ? `:${model.thinking}` : ""}`;
+}
+
+function progressMessage(progress: ConsolidationProgress): string {
+	const signals = `${progress.signals} ${plural(progress.signals, "signal", "signals")}`;
+	const entries = `${progress.entries} ${plural(progress.entries, "entry", "entries")}`;
+	if (progress.stage === "prune") {
+		return `taste: merging and pruning — ${signals}, ${entries}`;
+	}
+	return `taste: extracting chunk ${progress.chunk} of ${progress.maxChunks} — ${signals}, ${entries}`;
 }
 
 function projectEntries(cwd: string): TasteEntry[] {
@@ -66,22 +169,49 @@ function statusText(runtime: Runtime, cwd: string): string {
 	].join("\n");
 }
 
-function viewText(runtime: Runtime, cwd: string): string {
-	const merged = mergeTasteEntries(projectEntries(cwd), globalEntries()).sort(
-		(a, b) => b.confidence - a.confidence,
+function formatEntryLine(entry: TasteEntry): string {
+	return `id:${entry.id} ${Math.round(entry.confidence * 100)}% [${entry.category}] ${entry.content}`;
+}
+
+function entrySection(label: string, entries: readonly TasteEntry[], total: number, note?: string): string {
+	const sorted = [...entries].sort(
+		(a, b) => b.confidence - a.confidence || b.updatedAt.localeCompare(a.updatedAt),
 	);
-	if (merged.length === 0) return "taste: no entries yet";
-	return merged
-		.map((entry) => `${Math.round(entry.confidence * 100)}% [${entry.category}] ${entry.content}`)
-		.join("\n");
+	const lines = sorted.map(formatEntryLine);
+	if (note) lines.push(note);
+	return `${label} (${total})\n${lines.join("\n")}`;
+}
+
+function viewText(runtime: Runtime, cwd: string): string {
+	void runtime;
+	const project = projectEntries(cwd);
+	const global = globalEntries();
+	if (project.length === 0 && global.length === 0) return "taste: no entries yet";
+
+	// A project entry whose content is also in the global layer is the same
+	// preference; the global row already shows it, so hide the duplicate but count it.
+	const globalKeys = new Set(global.map((entry) => normalizeTasteContent(entry.content)));
+	const visibleProject = project.filter((entry) => !globalKeys.has(normalizeTasteContent(entry.content)));
+	const hidden = project.length - visibleProject.length;
+
+	const sections: string[] = [];
+	if (project.length > 0) {
+		const note = hidden > 0
+			? `  \u2026 ${hidden} more ${hidden === 1 ? "entry" : "entries"} also promoted to global`
+			: undefined;
+		sections.push(entrySection("project", visibleProject, project.length, note));
+	}
+	if (global.length > 0) sections.push(entrySection("global", global, global.length));
+	return sections.join("\n\n");
 }
 
 export function registerTasteCommand(pi: ExtensionAPI, runtime: Runtime): void {
 	pi.registerCommand("taste", {
-		description: "Taste: status, enable/disable, view, consolidate, prune, remember, forget, promote, export",
+		description: `Taste: ${SUBCOMMANDS.filter((sub) => sub.name !== "help").map((sub) => sub.name).join(", ")}`,
+		getArgumentCompletions: subcommandCompletions,
 		handler: async (args: string, ctx: ExtensionCommandContext) => {
 			runtime.ensureConfig(ctx.cwd);
-			const { parts, project } = parseArgs(args);
+			const { parts, project, global, dry } = parseArgs(args);
 			const sub = parts[0] ?? "status";
 			const selector = parts.slice(1).join(" ").trim();
 
@@ -118,6 +248,34 @@ export function registerTasteCommand(pi: ExtensionAPI, runtime: Runtime): void {
 						opId: newOpId(),
 					});
 					ctx.ui.notify(`taste: recorded "${selector}" (100%, explicit)`, "info");
+					return;
+				}
+				case "category": {
+					// The category is the trailing token, so the selector may contain
+					// spaces; category names never do.
+					const parsed = parseCategoryArgs(parts.slice(1), Object.keys(runtime.config.categories));
+					if ("error" in parsed) {
+						ctx.ui.notify(parsed.error, "warning");
+						return;
+					}
+					const { target, category } = parsed;
+					const entry = findEntry(projectEntries(ctx.cwd), target) ?? findEntry(globalEntries(), target);
+					if (!entry) {
+						ctx.ui.notify(`taste: no entry matching "${target}"`, "warning");
+						return;
+					}
+					if (entry.category === category) {
+						ctx.ui.notify(`taste: "${entry.content}" is already ${category}`, "info");
+						return;
+					}
+					// Category is not part of the content-hash id, so this is a plain
+					// last-write-wins upsert that keeps provenance and confidence.
+					const at = new Date().toISOString();
+					const path = ledgerPath(entry.scope === "global" ? globalTasteDir() : projectTasteDir(ctx.cwd));
+					appendLedger(path, [
+						{ type: "entry.upserted", at, entry: { ...entry, category, updatedAt: at }, opId: newOpId() },
+					]);
+					ctx.ui.notify(`taste: "${entry.content}" → ${category}`, "info");
 					return;
 				}
 				case "forget": {
@@ -342,11 +500,28 @@ export function registerTasteCommand(pi: ExtensionAPI, runtime: Runtime): void {
 				}
 				case "help":
 				default: {
-					ctx.ui.notify(HELP, "info");
+					ctx.ui.notify(helpText(), "info");
 				}
 			}
 		},
 	});
+}
+
+/** Exposed for tests: parse `<text | id:...> <category>` into a target and a validated category. */
+export function parseCategoryArgs(
+	rest: readonly string[],
+	known: readonly string[] = Object.keys(DEFAULT_CATEGORIES),
+): { target: string; category: string } | { error: string } {
+	const vocabulary = [...new Set(known)];
+	if (rest.length < 2) {
+		return { error: `taste: category <text | id:...> <category>\ncategories: ${vocabulary.join(", ")}` };
+	}
+	const category = rest[rest.length - 1] as string;
+	const target = rest.slice(0, -1).join(" ").trim();
+	if (!vocabulary.includes(category)) {
+		return { error: `taste: unknown category "${category}"\ncategories: ${vocabulary.join(", ")}` };
+	}
+	return { target, category };
 }
 
 /** Exposed for tests: the exact injected section for the current ledgers. */
@@ -356,3 +531,12 @@ export function previewSection(runtime: Runtime, cwd: string): string | undefine
 		maxTokens: runtime.config.maxInjectedTokens,
 	});
 }
+
+/** Exposed for tests: subcommand autocomplete candidates for a slash-command prefix. */
+export { helpText, subcommandCompletions };
+
+/** Exposed for tests: the editor-area loader and its progress text. */
+export { ConsolidationLoader, progressMessage };
+
+/** Exposed for tests: the `/taste view` rendering and category argument parsing. */
+export { formatEntryLine, viewText };
