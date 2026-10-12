@@ -1,11 +1,11 @@
 import type { ModelThinkingLevel } from "@earendil-works/pi-ai";
-import { resolveConfiguredModel, type TasteStage } from "./config.js";
+import { resolveConfiguredModel, type WorkerStage } from "./config.js";
 import type { Runtime } from "./runtime.js";
 
 export interface ResolveModelCtx {
 	model: unknown;
 	modelRegistry: unknown;
-	stage: TasteStage;
+	stage: WorkerStage;
 	thinkingLevel?: ModelThinkingLevel;
 }
 
@@ -16,8 +16,6 @@ export interface ResolvedWorkerModel {
 	env?: Record<string, string>;
 	baseUrl?: string;
 	thinking?: ModelThinkingLevel;
-	fallbackUsed?: boolean;
-	primaryFailure?: string;
 }
 
 type AuthPayload = { ok?: boolean; apiKey?: unknown; headers?: unknown; env?: unknown; baseUrl?: unknown };
@@ -77,9 +75,9 @@ async function resolveCandidate(registry: any, model: unknown): Promise<Candidat
 }
 
 /**
- * Resolve the model a taste stage should use: the configured model (or
- * `modelMap` match) when it resolves in pi's registry, else the session model,
- * then the configured fallback model when the primary is unusable.
+ * Resolve the model a taste stage should use: a session override if set, else
+ * the `modelMap` match for this stage, else the session model. An unusable
+ * model fails the stage; set `modelMap` or `/taste model` to route it.
  */
 export async function resolveTasteModel(
 	runtime: Runtime,
@@ -87,7 +85,8 @@ export async function resolveTasteModel(
 ): Promise<ResolvedWorkerModel | undefined> {
 	const registry = ctx.modelRegistry as any;
 	let model = ctx.model;
-	const configured = resolveConfiguredModel(runtime.config, ctx.model, ctx.stage, ctx.thinkingLevel);
+	// A session override wins over the config model and modelMap.
+	const configured = runtime.modelOverride ?? resolveConfiguredModel(runtime.config, ctx.model, ctx.stage, ctx.thinkingLevel);
 	let thinking = configured?.thinking;
 	if (configured) {
 		const found = registry.find?.(configured.provider, configured.id);
@@ -98,17 +97,5 @@ export async function resolveTasteModel(
 
 	const primary = await resolveCandidate(registry, model);
 	if (primary.ok) return { ...primary, thinking };
-
-	const fallback = runtime.config.fallbackModel;
-	if (!fallback) return undefined;
-	const fallbackModel = registry.find?.(fallback.provider, fallback.id);
-	if (!fallbackModel) return undefined;
-	const resolvedFallback = await resolveCandidate(registry, fallbackModel);
-	if (!resolvedFallback.ok) return undefined;
-	return {
-		...resolvedFallback,
-		thinking: fallback.thinking,
-		fallbackUsed: true,
-		primaryFailure: primary.reason,
-	};
+	return undefined;
 }

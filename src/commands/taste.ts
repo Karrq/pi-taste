@@ -50,6 +50,9 @@ function statusText(runtime: Runtime, cwd: string): string {
 		(entry) => entry.confidence >= runtime.config.injectionConfidenceFloor,
 	);
 	const { classifier } = runtime.config;
+	const worker = runtime.modelOverride
+		? `override ${formatConfiguredModel(runtime.modelOverride)}`
+		: "session model (modelMap applies)";
 	return [
 		`taste: ${runtime.config.enabled ? "enabled" : "disabled"}`,
 		`project: ${project.length} entries — ${projectTasteDir(cwd)}`,
@@ -57,6 +60,7 @@ function statusText(runtime: Runtime, cwd: string): string {
 		`injectable: ${eligible.length} (floor ${runtime.config.injectionConfidenceFloor})`,
 		`prune: inferred entries below ${runtime.config.pruneConfidenceFloor}`,
 		`classifier: ${classifier.mode} via ${classifier.provider}${classifier.model ? `/${classifier.model}` : ""}`,
+		`worker model: ${worker}`,
 	].join("\n");
 }
 
@@ -225,6 +229,35 @@ export function registerTasteCommand(pi: ExtensionAPI, runtime: Runtime): void {
 					ctx.ui.notify(statusText(runtime, ctx.cwd), "info");
 					return;
 				}
+				case "model": {
+					const spec = selector.trim();
+					const registry = ctx.modelRegistry as { find?: (provider: string, id: string) => unknown } | undefined;
+					if (!spec || spec === "status" || spec === "show") {
+						const current = runtime.modelOverride
+							? `session override ${formatConfiguredModel(runtime.modelOverride)}`
+							: "session model (modelMap applies)";
+						ctx.ui.notify(`taste: worker model \u2014 ${current}`, "info");
+						return;
+					}
+					if (spec === "reset" || spec === "clear" || spec === "default" || spec === "session") {
+						runtime.modelOverride = undefined;
+						ctx.ui.notify("taste: session model override cleared", "info");
+						return;
+					}
+					const parsed = resolveModelString(spec, {});
+					if (!parsed) {
+						ctx.ui.notify("taste: model <provider/id[:thinking]> | reset", "warning");
+						return;
+					}
+					runtime.modelOverride = parsed;
+					const found = registry?.find?.(parsed.provider, parsed.id);
+					ctx.ui.notify(
+						`taste: session model \u2192 ${formatConfiguredModel(parsed)}${found ? "" : " (not in registry; will fall back)"}`,
+						found ? "info" : "warning",
+					);
+					return;
+				}
+				case "help":
 				default: {
 					ctx.ui.notify(HELP, "info");
 				}

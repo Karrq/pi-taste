@@ -1,4 +1,4 @@
-import { type Config, DEFAULTS, loadConfig } from "./config.js";
+import { type Config, type ConfiguredModel, DEFAULTS, loadConfig } from "./config.js";
 
 /** One line per pipeline stage failure, surfaced by `/taste status`. */
 export interface StageErrors {
@@ -18,6 +18,8 @@ export class Runtime {
 	phase: string | undefined;
 	/** Rendered `<taste>` snapshot, frozen between compactions. */
 	tasteSnapshot: string | undefined;
+	/** Session-only worker model override set by `/taste model`; never persisted. */
+	modelOverride: ConfiguredModel | undefined;
 	/** Set whenever a run finishes, so the next run can report what failed. */
 	stageErrors: StageErrors = {};
 

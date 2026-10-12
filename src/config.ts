@@ -9,9 +9,9 @@ export interface ConfiguredModel {
 	thinking?: ModelThinkingLevel;
 }
 
-/** The pipeline stages, each independently routable to a model. */
-export const TASTE_STAGES = ["extract", "distill", "reflect", "reconcile", "prune"] as const;
-export type TasteStage = (typeof TASTE_STAGES)[number];
+/** Pipeline stages that resolve a worker model, and so can be routed by `modelMap`. */
+export const WORKER_STAGES = ["extract", "reflect"] as const;
+export type WorkerStage = (typeof WORKER_STAGES)[number];
 
 /**
  * Glob-matched routing for a stage's model. `match` tests the active session
@@ -21,7 +21,7 @@ export type TasteStage = (typeof TASTE_STAGES)[number];
  */
 export interface ModelMapEntry {
 	match: string;
-	stages?: TasteStage[];
+	stages?: WorkerStage[];
 	model: string;
 }
 
@@ -105,8 +105,7 @@ export interface Config {
 	reflectMaxEntries: number;
 	agentMaxTurns: number;
 	agentMaxTokens: number;
-	model?: ConfiguredModel;
-	fallbackModel?: ConfiguredModel;
+	/** Glob routing per stage. With no match the worker uses the session model. */
 	modelMap: ModelMapEntry[];
 	debugLog: boolean;
 	/** Disable all work without touching settings. */
@@ -148,8 +147,8 @@ function isThinkingLevel(value: unknown): value is ModelThinkingLevel {
 	return typeof value === "string" && (THINKING_LEVELS as readonly string[]).includes(value);
 }
 
-function isTasteStage(value: unknown): value is TasteStage {
-	return typeof value === "string" && (TASTE_STAGES as readonly string[]).includes(value);
+function isWorkerStage(value: unknown): value is WorkerStage {
+	return typeof value === "string" && (WORKER_STAGES as readonly string[]).includes(value);
 }
 
 function positiveInteger(value: unknown): number | undefined {
@@ -226,7 +225,7 @@ export function activeModelKey(model: unknown): string | undefined {
 export function resolveConfiguredModel(
 	config: Config,
 	activeModel: unknown,
-	stage?: TasteStage,
+	stage?: WorkerStage,
 	sessionThinking?: ModelThinkingLevel,
 ): ConfiguredModel | undefined {
 	const key = activeModelKey(activeModel);
@@ -240,22 +239,12 @@ export function resolveConfiguredModel(
 			if (resolved) return resolved;
 		}
 	}
-	return config.model;
+	return undefined;
 }
 
-function normalizeModel(value: unknown): ConfiguredModel | undefined {
-	if (!isRecord(value)) return undefined;
-	const provider = nonEmptyString(value.provider);
-	const id = nonEmptyString(value.id);
-	if (!provider || !id) return undefined;
-	const model: ConfiguredModel = { provider, id };
-	if (isThinkingLevel(value.thinking)) model.thinking = value.thinking;
-	return model;
-}
-
-function normalizeStages(value: unknown): TasteStage[] | undefined {
+function normalizeStages(value: unknown): WorkerStage[] | undefined {
 	if (!Array.isArray(value)) return undefined;
-	const stages = value.filter(isTasteStage);
+	const stages = value.filter(isWorkerStage);
 	return stages.length > 0 ? [...new Set(stages)] : undefined;
 }
 
@@ -263,7 +252,10 @@ function normalizeModelMapEntry(value: unknown): ModelMapEntry | undefined {
 	if (!isRecord(value)) return undefined;
 	const match = nonEmptyString(value.match);
 	const model = nonEmptyString(value.model);
-	if (!match || !model || !model.includes("/")) return undefined;
+	// A literal `/` is the usual provider/id shape, but `$model` and `$provider`
+	// supply the provider at resolve time and carry no slash of their own.
+	const hasProvider = model?.includes("/") || model?.includes("$model") || model?.includes("$provider");
+	if (!match || !model || !hasProvider) return undefined;
 	const entry: ModelMapEntry = { match, model };
 	const stages = normalizeStages(value.stages);
 	// A present-but-unusable `stages` rejects the entry rather than widening it
@@ -327,10 +319,6 @@ function normalizeSettingsConfig(value: Record<string, unknown>): NormalizedSett
 	if (agentMaxTurns !== undefined) normalized.agentMaxTurns = agentMaxTurns;
 	const agentMaxTokens = positiveInteger(value.agentMaxTokens);
 	if (agentMaxTokens !== undefined) normalized.agentMaxTokens = agentMaxTokens;
-	const model = normalizeModel(value.model);
-	if (model) normalized.model = model;
-	const fallbackModel = normalizeModel(value.fallbackModel);
-	if (fallbackModel) normalized.fallbackModel = fallbackModel;
 	const modelMap = normalizeModelMap(value.modelMap);
 	if (modelMap) normalized.modelMap = modelMap;
 	const classifier = normalizeClassifierPartial(value.classifier);
