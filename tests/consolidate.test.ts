@@ -93,7 +93,7 @@ describe("runTasteConsolidation", () => {
 			runExtraction: async (args) => [signal("Always use tabs", [args.allowedSourceEntryIds[0]])],
 		});
 
-		expect(summary).toEqual({ chunks: 1, signalsRecorded: 1, entriesUpserted: 1, entriesRetracted: 0, reachedEnd: true });
+		expect(summary).toEqual({ chunks: 1, signalsRecorded: 1, entriesUpserted: 1, entriesRetracted: 0, reachedEnd: true, cancelled: false });
 		expect(appended).toHaveLength(1);
 		expect(appended[0]?.customType).toBe(TASTE_COVERAGE);
 		expect((appended[0]?.data as { coversUpToId: string }).coversUpToId).toBe("m2");
@@ -125,8 +125,46 @@ describe("runTasteConsolidation", () => {
 			runExtraction: async () => undefined,
 		});
 
-		expect(summary).toEqual({ chunks: 1, signalsRecorded: 0, entriesUpserted: 0, entriesRetracted: 0, reachedEnd: true });
+		expect(summary).toEqual({ chunks: 1, signalsRecorded: 0, entriesUpserted: 0, entriesRetracted: 0, reachedEnd: true, cancelled: false });
 		expect(appended).toHaveLength(1);
 		expect((appended[0]?.data as { signalCount: number }).signalCount).toBe(0);
+	});
+
+	it("emits an extract event per chunk and a prune event, with running counts", async () => {
+		const entries = [message("m1", "always use tabs"), message("m2", "never use default exports")];
+		const { pi, runtime, ctx } = harness(entries, { extractChunkMaxTokens: 20 });
+		const events: Array<{ stage: string; chunk: number; maxChunks: number; signals: number; entries: number }> = [];
+		ctx.onProgress = (event) => events.push(event);
+
+		await runTasteConsolidation(pi, runtime, ctx, {
+			resolveModel: async () => ({ model: {} }),
+			runExtraction: async (args) => [signal("Always use tabs", [args.allowedSourceEntryIds[0]])],
+		});
+
+		const stages = events.map((event) => event.stage);
+		expect(stages.filter((stage) => stage === "extract").length).toBeGreaterThanOrEqual(2);
+		expect(stages.at(-1)).toBe("prune");
+		expect(events[0]).toMatchObject({ stage: "extract", chunk: 1, maxChunks: runtime.config.consolidateMaxChunks });
+		expect(events.at(-1)).toMatchObject({ stage: "prune" });
+	});
+
+	it("drops the in-flight chunk and skips prune when aborted", async () => {
+		const entries = [message("m1", "always use tabs"), message("m2", "never use default exports")];
+		const { pi, appended, runtime, ctx } = harness(entries, { extractChunkMaxTokens: 20 });
+		const controller = new AbortController();
+		ctx.signal = controller.signal;
+
+		const summary = await runTasteConsolidation(pi, runtime, ctx, {
+			resolveModel: async () => ({ model: {} }),
+			runExtraction: async (args) => {
+				controller.abort();
+				return [signal("Always use tabs", [args.allowedSourceEntryIds[0]])];
+			},
+		});
+
+		expect(summary.cancelled).toBe(true);
+		expect(summary.chunks).toBe(0);
+		expect(summary.signalsRecorded).toBe(0);
+		expect(appended).toHaveLength(0);
 	});
 });

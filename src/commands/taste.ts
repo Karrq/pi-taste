@@ -388,7 +388,21 @@ export function registerTasteCommand(pi: ExtensionAPI, runtime: Runtime): void {
 					}
 					runtime.runInFlight = true;
 					runtime.clearStageErrors();
+					// Take over the editor only in the TUI and only for this explicit run;
+					// RPC/print keep the notify-only path.
+					let loader: ConsolidationLoader | undefined;
+					let closeLoader: (() => void) | undefined;
+					let loaderDone: Promise<void> | undefined;
+					const controller = ctx.mode === "tui" ? new AbortController() : undefined;
 					try {
+						if (ctx.mode === "tui" && controller) {
+							loaderDone = ctx.ui.custom<void>((tui, theme, _kb, done) => {
+								closeLoader = () => done(undefined);
+								const created = new ConsolidationLoader(tui, theme, "taste: consolidating…", () => controller.abort());
+								loader = created;
+								return created;
+							});
+						}
 						const summary = await runTasteConsolidation(pi, runtime, {
 							cwd: ctx.cwd,
 							hasUI: ctx.hasUI,
@@ -397,20 +411,35 @@ export function registerTasteCommand(pi: ExtensionAPI, runtime: Runtime): void {
 							modelRegistry: ctx.modelRegistry,
 							thinkingLevel: ctx.thinkingLevel,
 							sessionManager: ctx.sessionManager,
+							opId: newOpId(),
+							onProgress: (progress) => loader?.setMessage(progressMessage(progress)),
+							...(controller ? { signal: controller.signal } : {}),
 						});
-						// Explicit consolidation writes the ledger but deliberately does not
-						// refresh the injected snapshot; that happens at the next compaction.
-						const remainder = summary.reachedEnd ? "" : " (more remain; run again)";
-						ctx.ui.notify(
-							`taste: ${summary.signalsRecorded} signal${summary.signalsRecorded === 1 ? "" : "s"}, `
-							+ `${summary.entriesUpserted} entr${summary.entriesUpserted === 1 ? "y" : "ies"}, `
-							+ `${summary.entriesRetracted} retracted from ${summary.chunks} chunk${summary.chunks === 1 ? "" : "s"}${remainder}`,
-							"info",
-						);
+						if (summary.cancelled) {
+							ctx.ui.notify(
+								`taste: cancelled — ${summary.signalsRecorded} signal${summary.signalsRecorded === 1 ? "" : "s"}, `
+								+ `${summary.entriesUpserted} entr${summary.entriesUpserted === 1 ? "y" : "ies"} kept; `
+								+ "the in-flight chunk was not committed",
+								"warning",
+							);
+						} else {
+							// Explicit consolidation writes the ledger but deliberately does not
+							// refresh the injected snapshot; that happens at the next compaction.
+							const remainder = summary.reachedEnd ? "" : " (more remain; run again)";
+							ctx.ui.notify(
+								`taste: ${summary.signalsRecorded} signal${summary.signalsRecorded === 1 ? "" : "s"}, `
+								+ `${summary.entriesUpserted} entr${summary.entriesUpserted === 1 ? "y" : "ies"}, `
+								+ `${summary.entriesRetracted} retracted from ${summary.chunks} chunk${summary.chunks === 1 ? "" : "s"}${remainder}`,
+								"info",
+							);
+						}
 					} catch (error) {
 						const message = runtime.recordStageError("extract", error);
 						ctx.ui.notify(`taste: consolidation failed: ${message}`, "warning");
 					} finally {
+						loader?.dispose();
+						closeLoader?.();
+						await loaderDone?.catch(() => {});
 						runtime.runInFlight = false;
 					}
 					return;
